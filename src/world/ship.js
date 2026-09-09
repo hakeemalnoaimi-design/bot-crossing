@@ -243,11 +243,17 @@ export class Ship {
     this.padLights = new THREE.Mesh(mergeWithColors(pads, padColors), this.padMaterial)
     this.group.add(this.padLights)
 
-    // Scorched apron under the ship.
+    // Scorched apron under the boat, with the island's name painted across it the way a
+    // helipad carries its letters. The apron is a child of the boat's own group, which is
+    // turned to face the middle of the island, so the lettering undoes that turn and takes
+    // the resting camera's heading instead — it reads the right way up from where the map
+    // is usually looked at.
     const apron = new THREE.Mesh(
-      new THREE.CircleGeometry((this.footRadius || 3) + 2.3, 32),
-      new THREE.MeshStandardMaterial({ color: 0x2f2c2c, roughness: 1, transparent: true, opacity: 0.65 })
+      new THREE.CircleGeometry((this.footRadius || 3) + 2.3, 48),
+      new THREE.MeshStandardMaterial({ map: padTexture('BotsBay'), roughness: 1, transparent: true })
     )
+    apron.rotation.order = 'YXZ'
+    apron.rotation.y = Math.PI / 4 - this.group.rotation.y
     apron.rotation.x = -Math.PI / 2
     apron.position.y = 0.05
     apron.receiveShadow = true
@@ -291,6 +297,51 @@ export class Ship {
     })
     this.scene.remove(this.group)
   }
+}
+
+/**
+ * The landing pad's markings: a dark scorched disc, a pale ring inside its edge, and the
+ * name across the middle. Drawn once; the disc is transparent so the ground shows through
+ * the char rather than being hidden by it.
+ */
+function padTexture(text, size = 512) {
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const c = canvas.getContext('2d')
+  const mid = size / 2
+
+  c.fillStyle = 'rgba(46, 42, 42, 0.68)'
+  c.fillRect(0, 0, size, size)
+
+  // The ring, and the tick marks a pad has.
+  c.strokeStyle = 'rgba(232, 224, 208, 0.55)'
+  c.lineWidth = size * 0.018
+  c.beginPath()
+  c.arc(mid, mid, size * 0.44, 0, Math.PI * 2)
+  c.stroke()
+  c.lineWidth = size * 0.012
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2
+    c.beginPath()
+    c.moveTo(mid + Math.cos(a) * size * 0.4, mid + Math.sin(a) * size * 0.4)
+    c.lineTo(mid + Math.cos(a) * size * 0.47, mid + Math.sin(a) * size * 0.47)
+    c.stroke()
+  }
+
+  // The name. Wide and bold, because from the resting camera the whole pad is a hundred
+  // pixels across and the letters have to survive that — and on the near half of the pad,
+  // where the boat standing in the middle does not hide it.
+  c.fillStyle = 'rgba(236, 228, 212, 0.92)'
+  c.textAlign = 'center'
+  c.textBaseline = 'middle'
+  c.font = `800 ${Math.round(size * 0.17)}px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif`
+  c.fillText(text, mid, mid + size * 0.3)
+
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.colorSpace = THREE.SRGBColorSpace
+  texture.anisotropy = 8
+  return texture
 }
 
 /**

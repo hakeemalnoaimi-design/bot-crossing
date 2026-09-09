@@ -55,7 +55,7 @@ test('settings are not merged field-wise — the last tab to touch a slider wins
 // ── the API, against a real socket ────────────────────────────────────────────
 
 async function withServer(run) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'bot-crossing-test-'))
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'botsbay-world-test-'))
   process.env.BOT_CROSSING_DATA = dir
   // Imported per-server so DATA_DIR is read fresh; the query string defeats the module cache.
   const { apiMiddleware } = await import(`../server/api.mjs?${dir}`)

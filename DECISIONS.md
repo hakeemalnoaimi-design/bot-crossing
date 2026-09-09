@@ -6,7 +6,7 @@ it needs to argue with the reason rather than work around it.
 Written down because the same questions kept arriving one PR at a time, and answering them
 per-PR was producing a codebase with three answers to each.
 
-## Bot Crossing never writes to a harness
+## BotsBay World never writes to a harness
 
 `data/colony.json` is the only file this project writes, anywhere.
 
@@ -17,7 +17,7 @@ the app rewrote the record from memory the next time it touched the thread. Hold
 together took a re-assert on every scan, a `ps` sweep to guess whether the app had re-read the
 file, and a *pending* state for the gap between them.
 
-So archiving is the colony's own bookkeeping now. The astronaut walks back to the ship exactly
+So archiving is the island's own bookkeeping now. The builder walks back to the boat exactly
 as before, and archiving in the harness's own UI still sends it home too, because the scan reads
 that flag. `setArchived` is not part of the adapter interface and adding one back is a bug.
 
@@ -64,7 +64,7 @@ mixing units would make one harness's buildings taller than another's for the sa
 
 ## Thread ids are prefixed
 
-`claude-code:<uuid>`, `codex:<uuid>`. Two UUIDs will not collide, but the colony keys its
+`claude-code:<uuid>`, `codex:<uuid>`. Two UUIDs will not collide, but the island keys its
 archive list and saved layout on this string, and it is worth being unambiguous rather than
 merely lucky. `colony.json` v1 files are migrated on read — only Claude Code ever wrote a bare
 id, so the rewrite is unambiguous.

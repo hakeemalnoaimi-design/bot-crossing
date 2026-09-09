@@ -6,7 +6,9 @@
  * of keys that moved, so the renderer can rebuild only what actually needs rebuilding.
  */
 
-const STORE_KEY = 'botcrossing.settings.v1'
+const STORE_KEY = 'botsbay.settings.v1'
+/** Where the settings lived before the rename. Read once, if the new key is empty. */
+const OLD_STORE_KEY = 'botcrossing.settings.v1'
 
 /**
  * What a fresh install opens on. Fixed rather than guessed from the device: `autoQuality`
@@ -305,7 +307,7 @@ function migrate(raw) {
 
 function load() {
   try {
-    const stored = localStorage.getItem(STORE_KEY)
+    const stored = localStorage.getItem(STORE_KEY) || localStorage.getItem(OLD_STORE_KEY)
     if (!stored) return {}
     const raw = JSON.parse(stored)
     return raw && typeof raw === 'object' ? migrate(raw) : {}
@@ -316,7 +318,7 @@ function load() {
 
 export function hasStoredSettings() {
   try {
-    return Boolean(localStorage.getItem(STORE_KEY))
+    return Boolean(localStorage.getItem(STORE_KEY) || localStorage.getItem(OLD_STORE_KEY))
   } catch {
     return false
   }

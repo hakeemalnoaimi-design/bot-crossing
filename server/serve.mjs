@@ -59,5 +59,5 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.listen(PORT, HOST, () => {
-  console.log(`Bot Crossing → http://${HOST}:${PORT}`)
+  console.log(`BotsBay World → http://${HOST}:${PORT}`)
 })

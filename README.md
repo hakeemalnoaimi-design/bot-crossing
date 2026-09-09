@@ -1,18 +1,20 @@
-# Bot Crossing — your agent threads, as a colony
+# BotsBay World — every agent working for BotsBay, as an island
 
-**[botcrossing.com](https://botcrossing.com)**
+A live 3D map of the agents working for BotsBay. Every thread — a Claude Code session, a
+Codex or Cursor session, an n8n workflow — is a little builder on a Gulf island. They come off
+the boat, claim a plot for their project, and build something. When one needs you it stops
+and holds a `?` over its head; click it and the thread opens back in whichever harness it came
+from.
 
-Every coding-agent thread on this machine is a little astronaut. They walk out of the ship, claim
-a plot for their repo, and build something. When one needs you it stops and holds a `?` over
-its head; click it and the thread opens back in whichever harness it came from.
-
-It reads the harness's own files, on your own machine. Nothing is uploaded, there is no
+It reads each harness's own files and API, on this machine. Nothing is uploaded, there is no
 account, and **it never writes to a harness at all** — `data/colony.json`, where the map lives,
 is the only file it writes anywhere.
 
-> **Status:** published as-is. I built this for myself and cannot promise to maintain it —
-> issues and PRs are welcome but may go unanswered, and forking is an entirely reasonable
-> thing to do. [CONTRIBUTING.md](CONTRIBUTING.md) sets out what to expect.
+BotsBay World is a fork of **[Bot Crossing](https://github.com/jarrenrocks/bot-crossing)** by
+Jarren Rocks (MIT), which drew the same idea as a moon colony. The Windows port, the Bahrain
+island and its light, the ambient life, the n8n adapter and the profiling tools are this fork's;
+the structure, the crew, the buildings and most of the words below are Jarren's. Bot Crossing's
+[CONTRIBUTING.md](CONTRIBUTING.md) still describes how the upstream project takes changes.
 
 ## Run it
 
@@ -35,7 +37,7 @@ the harness's own CLI opens instead when nothing answers it.
 
 ## Which harnesses work
 
-A **harness** is whatever actually runs your threads. Bot Crossing reads each one's local
+A **harness** is whatever actually runs your threads. BotsBay World reads each one's local
 session files through a small adapter, so support is per-harness and mostly a matter of
 somebody writing that adapter.
 
@@ -52,8 +54,8 @@ somebody writing that adapter.
 | [Qwen Code](https://github.com/QwenLM/qwen-code) (Alibaba) | ⬜ Not yet |
 | [Amazon Q Developer CLI](https://aws.amazon.com/q/developer/) | ⬜ Not yet |
 
-Every harness that is installed shows up at once — the colony is the union of all of them, and
-an astronaut carries the name of the harness it belongs to.
+Every harness that is installed shows up at once — the island is the union of all of them, and
+a builder carries the name of the harness it belongs to.
 
 ### Adding one
 
@@ -70,14 +72,14 @@ than have you work around it.
 
 ## What you are looking at
 
-| In the colony | In your threads |
+| In the island | In your threads |
 | --- | --- |
 | One hex zone | One repo. Bigger repos claim more tiles — one per seven threads, grown as a contiguous blob from the middle outward. A zone stays where it is: see below |
-| One astronaut + one building | One session |
+| One builder + one building | One session |
 | How finished a building looks | How large its transcript is, on a log scale |
 | Scaffolding | Somebody is at that site right now |
-| Walking out of the ship | A thread that just appeared |
-| Walking back into the ship | You archived it |
+| Coming off the boat | A thread that just appeared |
+| Walking back onto the boat | You archived it |
 
 ### A zone stays where it is
 
@@ -95,13 +97,13 @@ you have learned survives a reload — including for a repo whose last thread yo
 which comes back to the same ground when you start a new one.
 
 The version before this was a pure function of the thread counts: one session appearing
-anywhere changed the sort order, the order decided the tiles, and the whole colony re-laid
+anywhere changed the sort order, the order decided the tiles, and the whole island re-laid
 itself out. A zone you were watching could jump to the far side of the map because a
 *different* repo gained a thread.
 
 ### The deck has to clear the ground
 
-Inside the colony the terrain is gentle but not flat — it runs from about -0.3 to +0.24 on
+Inside the island the terrain is gentle but not flat — it runs from about -0.3 to +0.24 on
 the Moon, and half again as far on Mars. A deck's top face has to sit above the roughest
 ground any plot can be dealt, or the ground comes through it: the slab reads as sunken, props
 standing on it are buried to the waist, and every surface where the two meet tears. So the
@@ -114,10 +116,10 @@ Boulders and trees would end up under decks laid on top of them afterwards, poki
 fragments. The scatter is therefore rebuilt whenever a zone's footprint changes — cheap,
 because it no longer drags the terrain mesh along with it.
 
-Astronaut behaviour is a **strict precedence** rather than a set of independent flags, so a
+Builder behaviour is a **strict precedence** rather than a set of independent flags, so a
 thread can only ever be doing one thing. First match wins:
 
-| Signal | What the astronaut does | Badge |
+| Signal | What the builder does | Badge |
 | --- | --- | --- |
 | Errored | Slumps, red eyes, fault light stutters | `!` |
 | Running now | Hammers away at its building, sparks fly | `⚒` |
@@ -127,7 +129,7 @@ thread can only ever be doing one thing. First match wins:
 | Anything else | Potters around its plot, and now and then goes visiting | — |
 
 Only the states that want something from you get a badge. With most of a real thread list
-sitting quiet, a symbol over every astronaut buries the one `?` that actually matters.
+sitting quiet, a symbol over every builder buries the one `?` that actually matters.
 
 ### The island when nothing is happening
 
@@ -169,7 +171,7 @@ text over a soft halo with a small accent dot — no panel, no outline.
 
 ## Getting about
 
-Astronauts route rather than drift. Buildings and the landing pad are rasterised into a
+Builders route rather than drift. Buildings and the landing pad are rasterised into a
 navigation grid whenever the roster changes, and the crew walks it with A*, string-pulled
 afterwards so they take the corners they actually need instead of a visible staircase.
 
@@ -177,37 +179,37 @@ Two guarantees, deliberately independent:
 
 - **Routing** finds a way *around* a building, including threading the gaps between a ring of
   them. Blocking radii are the building's bounding radius trimmed a little plus the
-  astronaut's own width — the trim is what keeps those gaps walkable.
+  builder's own width — the trim is what keeps those gaps walkable.
 - **Collision** is applied to every step whether or not a path is being followed. Routing can
   fail — a site walled in between polls, a path budget that has not caught up — and walking
-  through a wall must not be what happens when it does. Blocked head-on, an astronaut slides
+  through a wall must not be what happens when it does. Blocked head-on, a builder slides
   along the obstacle instead of stopping dead.
 
-Measured over the live colony: 288 path legs, **0 crossing a building**, and **0 penetrations
+Measured over the live island: 288 path legs, **0 crossing a building**, and **0 penetrations
 across 78,000 agent-frames**. A typical path costs 6 µs (most are a clear straight shot and
 skip the search); the worst frame when a poll invalidates every route at once is 0.6 ms.
 
 They also push each other apart, so a busy plot is a crowd rather than a pile. That spacing
-is measured against the widest thing an astronaut wears — the helmet, at 0.95 units — because
+is measured against the widest thing a builder wears — the helmet, at 0.95 units — because
 holding a crowd at less than that is a crowd standing *inside* itself, which is what the first
 version did at 0.72. Arrival is derived from the same number and is deliberately larger: an
-astronaut that had to get closer than its neighbours would let it could never finish arriving,
+builder that had to get closer than its neighbours would let it could never finish arriving,
 and would shoulder at the crowd for as long as its thread existed.
 
 Standing spots are placed clear of the building's own blocked radius rather than at a fixed
 distance from it, and checked against the navigation grid — a spot inside a wall is a spot the
-crew can never reach, and the astronaut sent to it walks at that wall forever. Measured over
-the live colony: **68 of 68 astronauts settled, nobody closer than 1.14 units, no standing spot
-left inside an obstacle.** As a last resort an astronaut that has been blocked for six seconds
+crew can never reach, and the builder sent to it walks at that wall forever. Measured over
+the live island: **68 of 68 builders settled, nobody closer than 1.14 units, no standing spot
+left inside an obstacle.** As a last resort a builder that has been blocked for six seconds
 adopts the ground it got to instead of pushing on.
 
 ## Clicking one
 
 All of the chrome is one panel on the right — the name, the counts, and every repo. There
-is no top bar and no strip along the bottom: a colony is a place, and a place reads better
+is no top bar and no strip along the bottom: an island is a place, and a place reads better
 without a frame around it.
 
-An astronaut, a zone's deck, the name plate over it, or a repo in that list — all four drill
+A builder, a zone's deck, the name plate over it, or a repo in that list — all four drill
 into the same repo. Picking somebody is also picking the zone they are standing on.
 
 **The repo**, at the top, whether or not anybody is selected:
@@ -218,15 +220,15 @@ into the same repo. Picking somebody is also picking the zone they are standing 
   nothing is resumed and nothing is written.
 - **Finder** (Explorer on Windows) opens the folder, **Copy path** copies it.
 - Underneath, everything running in that repo, whoever wants something first. Clicking one
-  flies to its astronaut and selects it.
+  flies to its builder and selects it.
 
-**The thread**, when an astronaut is selected, in a card parked **beside that astronaut**
+**The thread**, when a builder is selected, in a card parked **beside that builder**
 rather than in the panel: its face, title, worktree, branch, model, last activity, and how
 far along its building is. The answer to "what is this one doing" belongs next to the thing
-you clicked, so the card follows its astronaut around the screen — preferring its right,
+you clicked, so the card follows its builder around the screen — preferring its right,
 flipping to its left rather than sliding under the sidebar, and never leaving the window.
 It is moved with a transform rather than with `left`/`top`, the one geometric change a
-browser makes without touching layout, so following a walking astronaut costs nothing.
+browser makes without touching layout, so following a walking builder costs nothing.
 
 - **Open** hands the thread back to whichever harness owns it and its app comes forward. On a
   Linux box with no desktop app to answer the deep link, a terminal opens with the CLI resuming
@@ -235,8 +237,8 @@ browser makes without touching layout, so following a walking astronaut costs no
   counts a thread as read once it has been focused in its own app, so one you answered in a
   terminal waves for good. This records when you looked, and the thread starts asking again the
   moment it does something newer.
-- **Archive** retires the thread *here*: the astronaut walks back up the ramp and boards the
-  ship. Nothing is written to the harness — see [Keeping it local](#keeping-it-local). A thread
+- **Archive** retires the thread *here*: the builder walks back up the ramp and boards the
+  boat. Nothing is written to the harness — see [Keeping it local](#keeping-it-local). A thread
   you archive in the harness's own app goes home on the next poll too, because the scan reads
   that flag.
 - **Hide** takes a whole repo off the map without touching a single thread. It comes back from
@@ -259,17 +261,17 @@ Archiving carries a deliberate one-writer discipline: the browser owns
 `data/colony.json` and PUTs it whole, `/api/archive` only touches Claude Code's records. If
 both wrote it, a save from a page holding older state would silently drop every archive made
 since that page loaded. Claude Code also rewrites its session records from memory and can
-stomp the flag, so the colony re-asserts it on every scan — an archive that gets stomped comes
+stomp the flag, so the island re-asserts it on every scan — an archive that gets stomped comes
 back within one poll.
 
 Nothing is ever written to your Claude Code data except that one `isArchived` field. The
 folder buttons only ever hand a path to `open`.
 
-The deep links above are the **Claude Code adapter's** business, not the colony's — another
+The deep links above are the **Claude Code adapter's** business, not the island's — another
 harness plugs its own in, and a harness with no deep link simply greys the button out. See
 [`server/harnesses/README.md`](server/harnesses/README.md).
 
-Plots are keyed by the folder's *name*, which is all the colony needs to draw one, so the path
+Plots are keyed by the folder's *name*, which is all the island needs to draw one, so the path
 is read back off the threads standing there. Where a name is ambiguous — `~/workspaces/1/foo`
 and `~/workspaces/2/foo`, which is what you get keeping parallel copies instead of worktrees —
 it grows leftward until it is not, and you get `1/foo` and `2/foo` on separate ground. Only
@@ -308,25 +310,25 @@ under **View → Return to isometric**.
 
 | Key | Does |
 | --- | --- |
-| `H` / `⌘\` | **Hide every panel.** The colony still reads: status lives above the astronauts' heads |
+| `H` / `⌘\` | **Hide every panel.** The island still reads: status lives above the builders' heads |
 | `S` | Settings |
-| `N` | Fly to the next astronaut waiting on you |
+| `N` | Fly to the next builder waiting on you |
 | `Enter` / `A` | Open / archive the selected thread |
 | `V` | Mark the selected thread viewed, so it stops asking |
 | `C` | New conversation in the open zone's folder |
 | `O` | Orbit mode |
-| `Tab` | Next planet |
+| `Tab` | Next world |
 | `L` | Next time of day |
 | `P` | Screenshot |
 | `0` | Reset the view |
 | `Esc` | Deselect, and close the zone sidebar |
 | `?` | Help |
 
-## Planets and light
+## Worlds and light
 
 Four worlds — **Bahrain**, then **Luna**, **Mars** and **Terra** — and a full day/night cycle
 you can scrub, let run, or set to **Live**, which follows the Bahrain clock so the island's
-light matches the light in the office. A planet is a bag of colours and a few switches;
+light matches the light in the office. A world is a bag of colours and a few switches;
 terrain, scatter, sky and lighting all read from the same preset, so a fifth world is a data
 change rather than a code change.
 
@@ -368,7 +370,7 @@ Rather than shipping an HDR environment map, the sky shader **is** the environme
 second copy of the sky dome — sharing the same uniforms, so it is always the sky you are
 actually standing under — is rendered into a prefiltered radiance map with `PMREMGenerator`
 and bound as `scene.environment`. That is what gives metal something to reflect and
-dielectrics a directional ambient, and it is why the colony changes *character* through the
+dielectrics a directional ambient, and it is why the island changes *character* through the
 day rather than just changing brightness: at dusk on Mars the panels pick up the sky, on the
 Moon they stay hard and neutral.
 
@@ -384,7 +386,7 @@ about PBR.
 
 The solar arc is tilted, so noon puts the sun 54° above the horizon and off to one side rather
 than at the zenith. That is load-bearing rather than decorative: a sun directly overhead puts
-`N·L` at zero on every vertical wall in the colony, and they go black with only ambient to
+`N·L` at zero on every vertical wall in the island, and they go black with only ambient to
 catch. The old procedural buildings were curved enough to hide it; a kit of flat-walled
 modules is not.
 
@@ -396,7 +398,7 @@ so lit surfaces stay crisp instead of going hazy.
 
 ## Where the art comes from
 
-The colony is built out of two CC0 asset packs by **[Kay Lousberg](https://kaylousberg.com)**,
+The island is built out of two CC0 asset packs by **[Kay Lousberg](https://kaylousberg.com)**,
 plus the project's own shaders on top of them.
 
 | Pack | Used for | Licence |
@@ -473,7 +475,7 @@ mkdir -p assets-src && cd assets-src
 
 `npm run assets` runs `tools/build-assets.mjs`, which drives `build-kit.mjs` once per model
 pack — merging a directory of single-model `.gltf` files into one document with one material
-and one texture — and then `build-crew.mjs`. That last one keeps the fifteen clips the colony actually plays out of
+and one texture — and then `build-crew.mjs`. That last one keeps the fifteen clips the island actually plays out of
 KayKit's 161 and — the part that matters — **retargets every animation channel onto the
 mannequin's own bones**. Merging glTF documents brings each animation file's private copy of the
 rig along with it, so without that step the finished file has five skeletons named `hips` and
@@ -488,13 +490,13 @@ three hundred draw calls and three hundred skeletons stepped on the CPU every fr
 
 So the animation is **baked once, at load, into a bone-matrix texture**. Every clip is sampled at
 30 fps and each frame's twenty-one skinning matrices are written into a float texture — 84×723
-texels for the whole set. One `InstancedMesh` then carries the entire crew, and each astronaut
+texels for the whole set. One `InstancedMesh` then carries the entire crew, and each builder
 reads its own row of that texture from a single per-instance float: the frame it is on. Skinning
 happens in the vertex shader, upstream of three's own instancing, so the skinned vertex still
 goes through `instanceMatrix` and the crew stays one draw whether there are six of them or six
 hundred.
 
-Everything the crew *wears* stays procedural and stays the colony's own: helmet, visor,
+Everything the crew *wears* stays procedural and stays the island's own: helmet, visor,
 screen-face, backpack, antenna and lamp. Those are pinned to bones the cheap way — the bake also
 writes the head and chest world transforms into a small array on the CPU, so placing a helmet is
 one matrix read rather than a skeleton evaluation, and a helmet can never be a frame out of step
@@ -512,7 +514,7 @@ its plot walks rather than hammering while it slides:
 | Nothing for three days | `Sit_Floor_Down` → `Sit_Floor_Idle`, and then it holds still |
 | Anything else | `Idle_A`, or `Walking_A` / `Running_A` while moving |
 
-The clip is chosen from the distance an astronaut **actually covered** last frame, not from
+The clip is chosen from the distance a builder **actually covered** last frame, not from
 the velocity it meant to have. The two come apart the moment something is in the way:
 collision refuses the step while velocity stays high, and an agent driven off intent alone
 walks on the spot against a wall. The measure rises instantly and falls over a tenth of a
@@ -522,25 +524,25 @@ standing pose, while a stride still gets to finish instead of freezing mid-step.
 Movement is shaped to match. A wander leg is walked at a decisive pace and stops dead on
 arrival rather than easing down through the speeds no standing clip can carry, and a leg that
 runs into the side of a building is abandoned at the first refused step. Measured across a
-live colony over a minute: **0.4% of agent-frames** disagree with what the body is doing, none
+live island over a minute: **0.4% of agent-frames** disagree with what the body is doing, none
 of them by more than 0.12 m/s.
 
 Stride playback follows actual ground speed, so short steps cannot moonwalk. An *idler*
 potters around its plot; a *sleeper* does not — it sits where it sat, and the only thing that
 can move it is being pushed out of someone it is overlapping, which converges and stops. The
-alternative is a cross-legged astronaut sliding across the deck, standing up to walk two
+alternative is a cross-legged builder sliding across the deck, standing up to walk two
 metres, and sitting down again every few seconds.
 
 Clips that do not loop are baked a millisecond short of their own duration. Sampled at exactly
 `duration` the mixer's default loop mode wraps to the start, so the frame a sit-down or a spawn
-*holds* would be the pose it began from — and the astronaut snaps upright on the last frame of
+*holds* would be the pose it began from — and the builder snaps upright on the last frame of
 sitting down.
 
 The crew also stands on the ground rather than on `y = 0`. A plot's tiles are a raised slab
 and the terrain between plots rolls half a metre either way, so a fixed height buries them for
-a good part of the colony. `Colony.groundAt()` answers with the deck height when a point is
+a good part of the island. `Colony.groundAt()` answers with the deck height when a point is
 over an allocated hex cell — an exact axial lookup, not a nearest-centre radius test — and the
-terrain field otherwise. It is sampled only when an astronaut has actually moved, and eased
+terrain field otherwise. It is sampled only when a builder has actually moved, and eased
 into, so walking up onto a deck reads as a step rather than a teleport.
 
 ## Performance
@@ -565,16 +567,16 @@ The knobs that actually matter, and why:
   panel is a doubled frame every few and reads as stutter rather than as slowness.
 - **HDR + bloom** off doesn't just skip the pass, it disposes the composer's float render
   targets. Turning it off on a weak machine gives the memory back.
-- **Shadows** track the camera rather than covering the whole colony, which is worth roughly a
+- **Shadows** track the camera rather than covering the whole island, which is worth roughly a
   doubling of effective resolution.
 
 What keeps it cheap at rest:
 
 - The crew's animated bodies are a single instanced, GPU-skinned draw, and each worn part —
   helmet, visor, face, pack, antenna, lamp — is one `InstancedMesh` across the whole crew. The
-  sixty-fifth astronaut costs a matrix write and one float, not a draw call. Per-agent suit
+  sixty-fifth builder costs a matrix write and one float, not a draw call. Per-agent suit
   colour, eye colour and facial expression ride along as instanced attributes.
-  Measured on a live colony: **66 astronauts and 66 buildings in 105 draw calls**.
+  Measured on a live island: **66 builders and 66 buildings in 105 draw calls**.
 - The crew also comes in two resolutions. The mannequin is six thousand triangles, and from
   the resting overview a builder is twenty pixels tall: fifteen triangles to the pixel, each
   shaded as a whole 2×2 quad by the rasteriser, twice a frame once the shadow pass is counted.
@@ -638,20 +640,20 @@ Each visor is a little rounded screen — the patch is a rectangle in UV space, 
 silhouette is cut in the fragment shader with a rounded-box SDF, which gives soft corners a
 rectangular patch can never have and lets the white helmet show through where the screen ends. All sixteen expressions are drawn once into a single 4×4
 canvas atlas as a white-on-black **mask** — never as finished artwork — and the colour arrives
-per-astronaut at draw time, so one 512px texture gives every agent its own eye colour without
+per-builder at draw time, so one 512px texture gives every agent its own eye colour without
 a second byte of memory. The shader reads the mask out of the red channel, blends between the
-dark screen and that astronaut's glow, and adds scanlines and a vignette so it reads as a
+dark screen and that builder's glow, and adds scanlines and a vignette so it reads as a
 screen rather than a decal.
 
 They blink on their own clocks, so a crowd never blinks in unison.
 
 ## A note on which side gets drawn
 
-The ship is procedural, and its bowls, engine bells and airlock collars are **open shells**.
+The boat is procedural, and its bowls, engine bells and airlock collars are **open shells**.
 Two things bite there: single-sided rendering lets you look straight through them, and a
 one-sided bowl cannot shadow-map — from the sun its concave interior is a back face at exactly
 its own depth, so it self-shadows to solid black whichever cull mode the depth pass uses. So
-the ship draws double-sided with a `BackSide` shadow side.
+the boat draws double-sided with a `BackSide` shadow side.
 
 The buildings want the exact opposite, and for the exact opposite reason. The model kit's
 pieces are **closed solids**, so there is nothing to see through — and being closed is why they
@@ -660,7 +662,7 @@ the ceiling underneath it sharing a plane all over the kit: a landing pad and th
 standing on it put 38 up-facing and 17 down-facing triangles at one height, and a habitat has
 two such planes, a lab four. Drawn double-sided, both halves of every one of those pairs
 rasterise at identical depth and the winner is settled by floating-point noise — which is a
-whole colony of surfaces flickering as the camera moves. Back-face culling throws the downward
+whole island of surfaces flickering as the camera moves. Back-face culling throws the downward
 half away before it can fight, so buildings render `FrontSide`.
 
 Worth knowing if you add a kit: the tell is that *every* clash is an up/down pair. Not one is
@@ -671,7 +673,7 @@ up/up, which is what makes culling a complete fix rather than a partial one.
 Turbine rotors spin in the **vertex shader**, not as child meshes, so a turbine is still one
 merged geometry and one draw call. Each spinning vertex carries the hub it turns about and how
 fast, which is what lets one building hold several of them, and one uniform write a frame turns
-every rotor in the colony. The tower is taken from the kit *solo* — without the sub-node the
+every rotor in the island. The tower is taken from the kit *solo* — without the sub-node the
 pack names separately — precisely so the rotor can be put back on as a part that moves.
 
 Two things to watch if you add another: `BufferGeometry.scale()` transforms position and normal
@@ -692,7 +694,7 @@ more interesting target than a localhost toy usually is. Three things hold it in
   `Host: their-domain`, and are refused.
 - **It checks `Origin`.** A cross-site `fetch` with a `text/plain` body is not preflighted, so
   without this any page you happened to have open could POST here — spawning sessions, opening
-  Finder windows, or overwriting the colony layout — even while unable to read the response.
+  Finder windows, or overwriting the island layout — even while unable to read the response.
   Requests from anywhere but this server's own page are refused.
 
 The practical cost: a bare `curl` POST is refused too, since browsers always send `Origin` on
@@ -701,7 +703,7 @@ if you are scripting against the API.
 
 ### Serving it to your network
 
-`BOT_CROSSING_HOST` changes what `npm run serve` binds to, so you can watch the colony from a
+`BOT_CROSSING_HOST` changes what `npm run serve` binds to, so you can watch the island from a
 tablet on the sofa:
 
 ```bash
@@ -743,32 +745,39 @@ server/
   serve.mjs    static server for the built app
 src/
   core/        settings, renderer + post chain, the Google Earth camera
-  world/       planets, terrain, sky, hex plots, the model kit, buildings, the ship
-  agents/      the crew rig and its bake, instanced astronauts, faces, badges, particles
-  game/        threads → colony, and the API client
+  world/       worlds, terrain, sky, hex plots, the model kit, buildings, the boat, gulls, boats
+  agents/      the crew rig and its bake, instanced builders, faces, badges, particles
+  game/        threads → island, and the API client
   ui/          the HUD
-tools/         asset packers — raw packs in, the three glbs the app loads out
+tools/         asset packers — raw packs in, the three glbs the app loads out — and the
+               headless profiler and screenshot tools (`npm run profile`, `npm run shot`)
 public/assets/ spacebase.glb, crew.glb, forest.glb
 ```
+
+The code keeps the vocabulary it was written in: the builders are `Astronauts` in
+`src/agents/astronauts.js`, the island is `Colony` in `src/game/colony.js`, the boat is `Ship`
+in `src/world/ship.js`, and the state file is `data/colony.json`. Renaming those would have
+meant a file nobody could diff and a saved map nobody could reload; the words you see on
+screen and in these docs are the ones that changed.
 
 Everything that knows what a *particular* harness's files look like lives in
 `server/harnesses/`. Everything else — the scanner, the API, the whole of `src/` — is written
 against the thread shape and never against a harness.
 
-Colony state lives in `data/colony.json` — where each zone sits and what you archived.
+Island state lives in `data/colony.json` — where each zone sits and what you archived.
 Deleting it only loses the archive list and the map's arrangement; the threads themselves are
-untouched, and the colony lays itself out again from scratch.
+untouched, and the island lays itself out again from scratch.
 
 ## Building your own
 
-Bot Crossing is one shape this idea can take. `.claude/skills/agent-session-world/` is a skill for
+BotsBay World is one shape this idea can take. `.claude/skills/agent-session-world/` is a skill for
 building the others — fish in a reef, animals in a forest, villagers, ants, boats in a harbour.
 Whatever inhabits it, the structure underneath is the same: a layout that stays put so you can
 learn the map, one draw call for the whole crowd, a single source of truth for what a thread is
 doing, and a camera with weight.
 
 It is written to take somebody's idea and fill in the frame around it, rather than to reproduce
-this particular colony. Four reference files carry the detail, and stand on their own whether or
+this particular island. Four reference files carry the detail, and stand on their own whether or
 not you build anything like this:
 
 - [making it feel alive](.claude/skills/agent-session-world/references/making-it-feel-alive.md) —
@@ -782,9 +791,13 @@ not you build anything like this:
 
 ## Who made this
 
-Built by **[Jarren Rocks](https://jarren.rocks)**, mostly as a side effect of building
-**[Emra](https://emra.app)** — which is where most of the threads in the screenshots come from,
-and why a tool for keeping track of a lot of them at once existed in the first place.
+Bot Crossing, which this is a fork of, was built by **[Jarren Rocks](https://jarren.rocks)**,
+mostly as a side effect of building **[Emra](https://emra.app)** — which is where most of the
+threads in the original screenshots came from, and why a tool for keeping track of a lot of
+them at once existed in the first place.
+
+BotsBay World is BotsBay's fork: the Windows port, the Bahrain island and its light, the
+ambient life, the n8n adapter, the per-thread dormancy rule and the profiling tools.
 
 ## Licence
 
@@ -798,11 +811,11 @@ Pack](https://kaylousberg.itch.io/kaykit-forest) — are built into the `.glb` f
 `public/assets/` and are covered by [CC0](https://creativecommons.org/publicdomain/zero/1.0/),
 not by the MIT licence above. CC0 asks for nothing; crediting Kay costs nothing either.
 
-The status badges above each astronaut's head are
+The status badges above each builder's head are
 [Material Design Icons](https://pictogrammers.com/library/mdi/), bundled via `@mdi/js` and
 licensed [Apache-2.0](https://github.com/Templarian/MaterialDesign/blob/master/LICENSE).
 
-Everything else you see — the shaders, the terrain, the sky, the ship, the crew's helmets and
+Everything else you see — the shaders, the terrain, the sky, the boat, the crew's helmets and
 faces, the plot decks and their kerbs — is drawn by this project and is MIT along with the code.
 
 Not affiliated with Anthropic, OpenAI, Google, or any of the other harness vendors listed above.

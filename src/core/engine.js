@@ -98,7 +98,7 @@ export class Engine {
     this.renderer.info.autoReset = false
 
     this.canvas = this.renderer.domElement
-    this.canvas.classList.add('bot-crossing-canvas')
+    this.canvas.classList.add('botsbay-canvas')
 
     /**
      * What is actually drawing this page, as the driver names it — "ANGLE (Intel, Intel(R)

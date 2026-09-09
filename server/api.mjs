@@ -46,7 +46,7 @@ function migrate(raw) {
  * Colony state is only ever the things the *game* invents — which plot a project got,
  * what a thread's building looks like, what you archived, which repos you took off the map.
  * The threads themselves stay
- * read-only: this file is the only thing Bot Crossing writes, anywhere.
+ * read-only: this file is the only thing BotsBay World writes, anywhere.
  */
 const emptyState = () => ({
   version: STATE_VERSION,
@@ -191,7 +191,7 @@ async function present(result) {
 /**
  * Mark the threads the colony has retired.
  *
- * Nothing is written anywhere. Bot Crossing used to set `isArchived` on the desktop app's own
+ * Nothing is written anywhere. Bot Crossing (the upstream project) used to set `isArchived` on the desktop app's own
  * session record, and it did land on disk — but the app serves from the copy it loaded at
  * launch, so the thread stayed put in its own list until the next restart, and the app would
  * rewrite the record from memory whenever it touched the thread. Papering over that took a
@@ -323,7 +323,7 @@ export async function apiMiddleware(req, res, next) {
   if (!url.pathname.startsWith('/api/')) return next ? next() : send(res, 404, { error: 'Not found' })
 
   if (!isLocalRequest(req)) {
-    return send(res, 403, { error: 'Bot Crossing only answers its own page on this machine' })
+    return send(res, 403, { error: 'BotsBay World only answers its own page on this machine' })
   }
 
   try {

@@ -22,6 +22,7 @@ const VIEWS = {
   close: 'rig.resetView(); rig.desiredDistance = 18; rig.distance = 18',
   ground: 'rig.resetView(); rig.desiredDistance = 9; rig.distance = 9; rig.desiredPolar = 1.25; rig.polar = 1.25',
   wide: 'rig.resetView(); rig.desiredDistance = 120; rig.distance = 120',
+  pad: 'rig.resetView(); rig.focus({ x: -22.8, y: 0, z: 0 }, { distance: 20 }); rig.target.set(-22.8, 0, 0); rig.distance = 20',
 }
 
 const { cdp, close } = await openApp({ threads: Number(args.threads) || 65, dist: args.dist || 'dist', port: 5398, debugPort: 9334, uncapped: false })

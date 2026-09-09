@@ -35,7 +35,7 @@ const app = document.getElementById('app')
 app.insertAdjacentHTML(
   'beforeend',
   `<div class="boot"><div class="inner">
-     <h1>Bot Crossing</h1>
+     <h1>BotsBay World</h1>
      <p>Scanning for agent threads…</p>
      <div class="bar"><i></i></div>
    </div></div>`
@@ -74,7 +74,7 @@ const actions = {
     const url = engine.canvas.toDataURL('image/png')
     const a = document.createElement('a')
     a.href = url
-    a.download = `bot-crossing-${colony.planet.id}-${stamp()}.png`
+    a.download = `botsbay-world-${colony.planet.id}-${stamp()}.png`
     a.click()
     hud.toast('Screenshot saved')
   },
@@ -108,7 +108,7 @@ const actions = {
     const key = status === 'agents' ? null : status
     const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
     if (!pool.length) {
-      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
+      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No builders on the island')
       return
     }
     pool.sort((a, b) => a.id.localeCompare(b.id))
@@ -198,7 +198,7 @@ const actions = {
     }
     selectedProject = null
     applyThreads(threads)
-    hud.toast(`Hidden ${name} — still in your harness, gone from the colony`)
+    hud.toast(`Hidden ${name} — still in your harness, gone from the island`)
   },
 
   unhideProject: (name) => {
@@ -340,7 +340,7 @@ function select(id, { fly = false } = {}) {
   }
 }
 
-/** Open a zone's sidebar. Any selected astronaut from a different zone lets go. */
+/** Open a zone's sidebar. Any selected builder from a different zone lets go. */
 function selectProject(name, { fly = false } = {}) {
   if (!name || !colony.plots.has(name)) return
   selectedProject = name
@@ -760,11 +760,12 @@ async function boot() {
     if (!document.hidden) poll()
   })
 
-  if (!localStorage.getItem('botcrossing.seen-help')) {
+  // The old key is honoured so a browser that has seen the sheet before is not shown it again.
+  if (!localStorage.getItem('botsbay.seen-help') && !localStorage.getItem('botcrossing.seen-help')) {
     hud.toggleHelp(true)
-    localStorage.setItem('botcrossing.seen-help', '1')
+    localStorage.setItem('botsbay.seen-help', '1')
   } else {
-    hud.hint('Drag to move · click an astronaut · H hides everything', 5200)
+    hud.hint('Drag to move · click a builder · H hides everything', 5200)
   }
 }
 
@@ -805,15 +806,16 @@ engine.add({
       if (!agent) select(null, {})
       else hud.placeCard(screenOf(agent))
     }
-    hud.setFps(engine.perf, engine.viewport, `${colony.astronauts.visibleCount} crew · ${colony.particles.liveCount} bits`)
+    hud.setFps(engine.perf, engine.viewport, `${colony.astronauts.visibleCount} builders · ${colony.particles.liveCount} bits`)
   },
 })
 
 engine.start()
 boot()
 
-// Handy for poking at the running colony from the console.
-window.botCrossing = { engine, rig, colony, settings, hud, poll, get threads() { return threads } }
+// Handy for poking at the running island from the console. The old name still answers.
+window.botsBay = { engine, rig, colony, settings, hud, poll, get threads() { return threads } }
+window.botCrossing = window.botsBay
 
 /** `execCommand('copy')` over a throwaway textarea — the copy that predates permissions. */
 function copyFallback(text) {

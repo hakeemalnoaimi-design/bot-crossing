@@ -1,7 +1,7 @@
 /**
  * `.env`, read once, for the harnesses that talk to something over a network.
  *
- * Bot Crossing's own harnesses read files on this machine and need no configuration at all.
+ * BotsBay World's own harnesses read files on this machine and need no configuration at all.
  * A hosted one — n8n, and whatever comes after it — needs a URL and a key, and those are
  * secrets: they belong in a file that is not in the repository and never in anything the
  * browser downloads.

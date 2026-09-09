@@ -52,7 +52,7 @@ const STAT_DEFS = [
   { key: 'waiting', label: 'need you', cls: 'waiting' },
   { key: 'blocked', label: 'blocked', cls: 'blocked' },
   { key: 'celebrating', label: 'shipped', cls: 'done' },
-  { key: 'agents', label: 'crew', cls: 'idle' },
+  { key: 'agents', label: 'builders', cls: 'idle' },
 ]
 
 export class Hud {
@@ -87,7 +87,7 @@ export class Hud {
       b.className = `stat ${def.cls}`
       b.type = 'button'
       b.dataset.key = def.key
-      b.title = `Jump to the next ${def.label} astronaut`
+      b.title = def.key === 'agents' ? 'Fly to the next builder' : `Fly to the next builder that is ${def.label}`
       b.innerHTML = `<i class="pip"></i><span class="n">0</span><span class="lbl">${def.label}</span>`
       b.type = 'button'
       b.addEventListener('click', () => this.actions.focusStatus?.(def.key))
@@ -118,7 +118,7 @@ export class Hud {
     const perf = group('Performance')
     perf.append(
       this._toggle('HDR + bloom', 'bloom', 'Glowing eyes, lamps and windows. The first thing to drop.'),
-      this._toggle('Tilt-shift', 'tiltShift', 'A shallow depth of field, which is what makes the colony read as a model.'),
+      this._toggle('Tilt-shift', 'tiltShift', 'A shallow depth of field, which is what makes the island read as a model.'),
       this._slider(
         'Tilt-shift blur',
         'tiltShiftStrength',
@@ -171,13 +171,13 @@ export class Hud {
       ),
       this._toggle('Adaptive quality', 'autoQuality', 'Quietly drops render scale if frames get expensive.'),
       this._slider('Scatter', 'scatterDensity', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
-      this._slider('Max crew', 'maxAgents', 10, 200, 10, (v) => String(v)),
+      this._slider('Max builders', 'maxAgents', 10, 200, 10, (v) => String(v)),
       this._toggle('Stars', 'stars')
     )
     body.appendChild(perf)
 
     // World.
-    const world = group('Planet')
+    const world = group('World')
     const planets = document.createElement('div')
     planets.className = 'planets'
     for (const id of PLANETS_ORDER) {
@@ -231,7 +231,7 @@ export class Hud {
       this._toggle(
         'Environment light',
         'ibl',
-        'Image-based lighting taken from this planet’s own sky. Metals get something to reflect.'
+        'Image-based lighting taken from this world’s own sky. Metals get something to reflect.'
       ),
       this._slider('Environment', 'iblIntensity', 0, 2, 0.05, (v) => v.toFixed(2)),
       this._slider('Exposure', 'exposure', 0.4, 2, 0.05, (v) => v.toFixed(2)),
@@ -434,7 +434,7 @@ export class Hud {
       b.addEventListener('click', () => this.actions.pickProject?.(p.name))
       wrap.appendChild(b)
     }
-    this.$('.sec-head span').textContent = `${projects.length} repo${projects.length === 1 ? '' : 's'}`
+    this.$('.sec-head span').textContent = `${projects.length} zone${projects.length === 1 ? '' : 's'}`
 
     // The hidden list is its own block at the foot of the sidebar: collapsed by default, because
     // the whole point of hiding a repo is not to look at it.
@@ -470,12 +470,12 @@ export class Hud {
       const row = document.createElement('div')
       row.className = 'repo hidden-repo folded-note'
       row.innerHTML =
-        `<span class="n">${folded.length} quiet repo${folded.length === 1 ? '' : 's'}` +
+        `<span class="n">${folded.length} quiet zone${folded.length === 1 ? '' : 's'}` +
         `, ${n} thread${n === 1 ? '' : 's'}</span>`
       const show = document.createElement('button')
       show.type = 'button'
       show.className = 'btn ghost show-repo'
-      show.title = 'Put dormant repos back on the map'
+      show.title = 'Put dormant zones back on the map'
       show.textContent = 'Show'
       show.addEventListener('click', () => this.settings.set('hideDormant', false))
       row.appendChild(show)
@@ -688,7 +688,7 @@ export class Hud {
     this._sideWidth = px
   }
 
-  /** Redraw the card's face so it blinks in step with the astronaut it belongs to. */
+  /** Redraw the card's face so it blinks in step with the builder it belongs to. */
   updateAvatar(faceAtlasCanvas) {
     if (!this.selected || !faceAtlasCanvas) return
     const agent = this.selected.agent
@@ -919,7 +919,7 @@ function ago(ts) {
 const TEMPLATE = `
 <aside class="side panel">
   <header class="brandbar">
-    <div class="brand"><i class="dot"></i>Bot Crossing</div>
+    <div class="brand"><i class="dot"></i>BotsBay World</div>
     <button class="btn icon ghost" id="btn-shot" title="Screenshot (P)">${ICON.camera}</button>
     <button class="btn icon ghost" id="btn-help" title="Help (?)">${ICON.help}</button>
     <button class="btn icon ghost" id="btn-hide" title="Hide all UI (H)">${ICON.eye}</button>
@@ -930,7 +930,7 @@ const TEMPLATE = `
 
   <div class="side-body">
     <div class="projects-pane">
-      <div class="sec-head"><span>Repos</span></div>
+      <div class="sec-head"><span>Zones</span></div>
       <div class="projects"></div>
       <div class="hidden-block" hidden>
         <button type="button" class="hidden-toggle" id="btn-hidden-toggle" aria-expanded="false">
@@ -941,7 +941,7 @@ const TEMPLATE = `
     </div>
 
     <div class="project-detail">
-      <button class="btn ghost back" id="btn-close-project" title="Back to every repo (Esc)">${ICON.back} All repos</button>
+      <button class="btn ghost back" id="btn-close-project" title="Back to every zone (Esc)">${ICON.back} All zones</button>
       <div class="who">
         <i class="swatch"></i>
         <div class="text">
@@ -956,7 +956,7 @@ const TEMPLATE = `
           <button class="btn" id="btn-reveal" title="Show this folder in ${FILE_MANAGER}">${ICON.folder} ${FILE_MANAGER}</button>
           <button class="btn" id="btn-copy-path" title="Copy the folder path">${ICON.copy} Copy path</button>
         </div>
-        <button class="btn" id="btn-hide-project" title="Hide this repo from the colony — does not archive its threads">${ICON.eyeOff} Hide from colony</button>
+        <button class="btn" id="btn-hide-project" title="Hide this zone from the island — does not archive its threads">${ICON.eyeOff} Hide from island</button>
       </div>
       <div class="threads-head"></div>
       <div class="threads"></div>
@@ -966,10 +966,10 @@ const TEMPLATE = `
 
 <div class="rail panel">
   <button class="btn icon" id="btn-home" title="Reset the view (0)">${ICON.home}</button>
-  <button class="btn icon" id="btn-next" title="Next astronaut waiting on you (N)">${ICON.next}</button>
+  <button class="btn icon" id="btn-next" title="Next builder waiting on you (N)">${ICON.next}</button>
   <div class="sep"></div>
-  <button class="btn icon" id="btn-orbit" title="Orbit mode — sweep around the colony (O)" aria-pressed="false">${ICON.orbit}</button>
-  <button class="btn icon" id="btn-planet" title="Change planet (Tab)">${ICON.globe}</button>
+  <button class="btn icon" id="btn-orbit" title="Orbit mode — sweep around the island (O)" aria-pressed="false">${ICON.orbit}</button>
+  <button class="btn icon" id="btn-planet" title="Change world (Tab)">${ICON.globe}</button>
   <button class="btn icon" id="btn-time" title="Change the time of day (L)">${ICON.sun}</button>
 </div>
 
@@ -993,7 +993,7 @@ const TEMPLATE = `
     <button class="btn primary" id="btn-open" title="Open this thread in the harness it came from (Enter)">${ICON.open} Open</button>
     <button class="btn" id="btn-viewed" title="Stop this thread asking for you until it moves on again (V)">${ICON.eye} Viewed</button>
     <button class="btn" id="btn-retry" title="Run this again in the harness it came from (R)">${ICON.retry} Retry</button>
-    <button class="btn" id="btn-archive" title="Archive — this astronaut walks back to the ship (A)">${ICON.archive} Archive</button>
+    <button class="btn" id="btn-archive" title="Archive — this builder walks back to the boat (A)">${ICON.archive} Archive</button>
   </div>
 </div>
 
@@ -1003,8 +1003,8 @@ const TEMPLATE = `
 
 <div class="help">
   <div class="sheet panel">
-    <h2>Bot Crossing</h2>
-    <p class="sub">Every coding-agent thread on this machine is an astronaut. They walk out of the ship, claim a plot for their repo, and build. Click one to open its thread; click a zone — its deck or its name — for the repo itself, and start a new conversation there. Hide a repo from that panel if you would rather not see it — its threads stay in your harness, and you can show it again from the list. Navigation works like Google Earth — drag the ground itself, right-drag to tilt, scroll to zoom in on whatever is under the cursor.</p>
+    <h2>BotsBay World</h2>
+    <p class="sub">Every agent working for BotsBay is a builder on this island. They come off the boat, claim a plot for their project, and build. Click one to open its thread; click a zone — its deck or its name — for the project itself, and start a new conversation there. Hide a project from that panel if you would rather not see it — its threads stay in your harness, and you can show it again from the list. Navigation works like Google Earth — drag the ground itself, right-drag to tilt, scroll to zoom in on whatever is under the cursor.</p>
     <div class="cols">
       <div>
         <div class="k"><span>Drag the ground</span><kbd>drag</kbd></div>
@@ -1025,7 +1025,7 @@ const TEMPLATE = `
         <div class="k"><span>New conversation</span><kbd>C</kbd></div>
         <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
         <div class="k"><span>Retry a failed run</span><kbd>R</kbd></div>
-        <div class="k"><span>Change planet</span><kbd>Tab</kbd></div>
+        <div class="k"><span>Change world</span><kbd>Tab</kbd></div>
         <div class="k"><span>Time of day</span><kbd>L</kbd></div>
         <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>
         <div class="k"><span>This sheet</span><kbd>?</kbd></div>
