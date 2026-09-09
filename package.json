@@ -37,6 +37,8 @@
     "start": "vite build && node server/serve.mjs",
     "serve": "node server/serve.mjs",
     "assets": "node tools/build-assets.mjs",
+    "profile": "node tools/profile.mjs",
+    "shot": "node tools/shot.mjs",
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {

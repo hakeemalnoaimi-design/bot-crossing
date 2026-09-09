@@ -417,12 +417,17 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
   // One material for the lot. The pack's atlas carries the greens and the greys, and the
   // per-instance colour is a *tint* on top of it — white for anything already the right
   // colour, the planet's own rock for a boulder that has to belong to this world.
+  //
+  // Lambert rather than the PBR material everything else wears: leaves and boulders are
+  // matte, and a specular lobe on them was never visible — but it was paid for, on the far
+  // palms in particular, which are scaled up and fill a good deal of the horizon. Lambert
+  // still takes the sky's irradiance from the environment map, so the shading changes
+  // character through the day with everything else; it just stops computing a highlight
+  // nobody could see.
   const atlas = ready ? atlasTexture('forest') : null
-  const material = new THREE.MeshStandardMaterial({
+  const material = new THREE.MeshLambertMaterial({
     map: atlas,
     color: 0xffffff,
-    roughness: isFlora ? 0.82 : 0.95,
-    metalness: 0,
     flatShading: !ready,
   })
 

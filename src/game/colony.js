@@ -739,7 +739,7 @@ export class Colony {
     this.ship.update(dt, elapsed, night)
 
     this._growBuildings(dt)
-    this.astronauts.update(dt, elapsed)
+    this.astronauts.update(dt, elapsed, this.camera)
     this.astronauts.updateRings(elapsed)
     this.indicators.update(this.astronauts.agents, elapsed, (a) => this._badgeFor(a))
     this._emit(dt, elapsed)

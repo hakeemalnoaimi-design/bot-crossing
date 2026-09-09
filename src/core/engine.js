@@ -14,6 +14,30 @@ const IS_WEBKIT =
   !/chrome|chromium|edg\//i.test(navigator.userAgent || '')
 
 /**
+ * How large the bloom's own buffers are, as a share of the drawing buffer.
+ *
+ * Bloom is a glow: it is blurred down through five levels and back up again, and whether
+ * the first of those levels is half the frame or a third of it is not something the eye
+ * can tell — but on an integrated GPU the difference was two milliseconds a frame,
+ * measured. The pass still reads the full-resolution frame for its bright pixels and
+ * still adds its result back at full resolution, so nothing lit gets softer than before.
+ */
+const BLOOM_SCALE = 0.7
+
+/**
+ * Frame rates the quality governor moves on.
+ *
+ * Below `SLOW` for three seconds running, it drops a step; above `FAST` for eight, it
+ * climbs. Everything between is where it holds still. The old floor was 45, which meant a
+ * machine could sit at fifty frames a second for as long as the window was open and the
+ * governor would call that settled — on a sixty-hertz panel that is a doubled frame every
+ * few, which reads as a stutter rather than as slowness. The floor is now just under the
+ * panel's own rate, so what the governor settles on is a scale that actually holds it.
+ */
+const SLOW_FPS = 55
+const FAST_FPS = 58
+
+/**
  * Renderer, post chain, and the frame loop.
  *
  * Two things here are load-bearing for performance:
@@ -75,6 +99,23 @@ export class Engine {
 
     this.canvas = this.renderer.domElement
     this.canvas.classList.add('bot-crossing-canvas')
+
+    /**
+     * What is actually drawing this page, as the driver names it — "ANGLE (Intel, Intel(R)
+     * UHD Graphics 630 …)". A laptop with two GPUs very often hands the browser the slow
+     * one, and nothing a page can ask for changes that; it can only say so. Read once, here,
+     * so the HUD can name the chip when the governor has had to back off.
+     */
+    this.gpuName = ''
+    try {
+      const gl = this.renderer.getContext()
+      const info = gl.getExtension('WEBGL_debug_renderer_info')
+      this.gpuName = String(info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER) || '')
+    } catch {
+      /* a browser that hides its renderer string is a browser that hides it */
+    }
+    /** Called once, the first time the governor drops below the chosen scale. */
+    this.onAutoScaled = null
 
     this.composer = null
     this.bloomPass = null
@@ -164,6 +205,8 @@ export class Engine {
         this.tiltShift.setAngle(s.get('tiltShiftAngle'))
         this.tiltShift.setCamera(this.camera)
       }
+      // Exactly one of the two finishes the frame.
+      if (this.outputPass) this.outputPass.enabled = !(this.tiltShift && this.tiltShift.enabled)
     }
 
     this.resize()
@@ -197,8 +240,8 @@ export class Engine {
 
     // After bloom, so an out-of-focus lamp keeps its glow and the glow goes soft with it
     // — blurring first would drop those pixels under the bloom threshold and switch the
-    // glow off exactly where the eye expects the most of it. Still before OutputPass, so
-    // the blur averages linear HDR values rather than tone-mapped ones.
+    // glow off exactly where the eye expects the most of it. It blurs linear HDR values,
+    // and its final composite is also where tone mapping and sRGB happen while it is on.
     this.tiltShift = createTiltShift()
     for (const pass of this.tiltShift.passes) composer.addPass(pass)
     // RenderPass and the bloom pass both leave their result in the composer's *read* buffer
@@ -211,8 +254,12 @@ export class Engine {
     this.tiltShift.setCamera(this.camera)
     this.tiltShift.setFocusDistance(this._focusDistance)
 
-    // OutputPass is what applies tone mapping + sRGB once, at the end of the chain.
-    composer.addPass(new OutputPass())
+    // OutputPass applies tone mapping + sRGB once, at the end of the chain — unless the
+    // tilt-shift is running, whose composite already did both on its way out. Two passes
+    // over every pixel of the frame is what that saves; see `applySettings`.
+    this.outputPass = new OutputPass()
+    this.outputPass.enabled = !this.settings.get('tiltShift')
+    composer.addPass(this.outputPass)
 
     this.smaaPass = new SMAAPass(1, 1)
     composer.addPass(this.smaaPass)
@@ -229,6 +276,7 @@ export class Engine {
     this.bloomPass = null
     this.smaaPass = null
     this.tiltShift = null
+    this.outputPass = null
   }
 
   /**
@@ -291,6 +339,8 @@ export class Engine {
     this._sizedAt = { bw, bh }
     this.renderer.setSize(bw, bh, false)
     this.composer?.setSize(bw, bh)
+    // After the composer, which has just sized the bloom to the whole buffer.
+    this.bloomPass?.setSize(Math.max(1, Math.round(bw * BLOOM_SCALE)), Math.max(1, Math.round(bh * BLOOM_SCALE)))
     this.tiltShift?.setSize(bw, bh)
     this.tiltShift?.setCamera(this.camera)
     this.viewport = { ...this.viewport, bw, bh, scale }
@@ -408,8 +458,8 @@ export class Engine {
     const floor = 0.35 * (window.devicePixelRatio || 1)
 
     // Sustained evidence, not one sample: 3 slow seconds to drop, 8 fast ones to climb.
-    this._slow = fps < 45 ? (this._slow || 0) + 1 : 0
-    this._fast = fps > 58 ? (this._fast || 0) + 1 : 0
+    this._slow = fps < SLOW_FPS ? (this._slow || 0) + 1 : 0
+    this._fast = fps > FAST_FPS ? (this._fast || 0) + 1 : 0
     const dpr = window.devicePixelRatio || 1
 
     let next = current
@@ -432,7 +482,9 @@ export class Engine {
       // Through the same path a resize takes, so the new targets are drawn into before the
       // compositor sees them — and so there is one place that knows how to change size.
       this._applyBufferSize(bw, bh, next)
+      const was = this.autoScaled
       this.autoScaled = next < ceiling - 0.01
+      if (this.autoScaled && !was) this.onAutoScaled?.()
     }
   }
 

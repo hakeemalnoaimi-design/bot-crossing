@@ -4,13 +4,19 @@ import { buildFaceAtlas, FACE, FACE_LOOPS, FRAME_COLS, FRAME_ROWS } from './face
 import { attachMatrixAt, decorateSkinned, frameFor } from './crew.js'
 
 /**
- * Every astronaut in the colony, drawn in seven draw calls.
+ * Every astronaut in the colony, drawn in a dozen instanced draws.
  *
  * The body is one instanced, GPU-skinned mesh playing KayKit's hand-animated clips (see
  * `crew.js`) — every torso, arm and leg in the colony in a single draw, whether there are
  * six threads or three hundred. Everything the crew *wears* stays procedural and stays in
  * its own `InstancedMesh`: helmet, visor, screen-face, backpack, antenna and lamp, because
  * those carry the colony's own identity and its own shaders.
+ *
+ * The body and the three parts on the head exist twice: a fine set for builders near the
+ * camera and a coarse one for everybody else — see `LOD_NEAR`. Same materials, same bone
+ * table, same shaders; only the triangle count differs, and it differs by a factor of
+ * five, which on an integrated GPU was the difference between the crowd being the most
+ * expensive thing in the frame and being one of the cheapest.
  *
  * Worn parts are pinned to bones the cheap way. The baked animation lives in an ordinary
  * array as well as in the texture the shader samples, so placing a helmet is one matrix
@@ -82,6 +88,26 @@ const DRIFT_PACE = 0.55
 const ARRIVE_RADIUS = SEPARATION + 0.45
 /** Paths computed per frame. Re-routing the whole crew takes a few frames, unnoticeably. */
 const PATH_BUDGET = 6
+
+/**
+ * Where a builder switches between its two bodies, in world units from the camera.
+ *
+ * At the resting overview a builder stands about twenty pixels tall, and the mannequin is
+ * six thousand triangles: fifteen triangles to the pixel, every one shaded as a whole 2×2
+ * quad by the rasteriser, twice a frame once the shadow pass is counted. Measured, that was
+ * the single largest cost in the frame on an integrated GPU — more than the ground — and
+ * none of it could be seen. Past `LOD_FAR` the body and the head's parts come from the
+ * clustered copies at a fifth of the triangles; inside `LOD_NEAR` the fine ones come back.
+ * The gap between the two is what stops a builder standing on the line from flickering.
+ *
+ * At 26 units a builder is about fifty pixels tall, which is where the coarse body first
+ * starts to read as coarse.
+ */
+const LOD_NEAR = 26
+const LOD_FAR = 30
+
+/** The parts whose colour is rewritten every frame — the ones that pulse. */
+const ANIMATED_PARTS = new Set(['tip', 'lamp'])
 
 /**
  * The mannequin is authored 2.2 units tall. The colony wants a "little guy" silhouette at
@@ -168,17 +194,6 @@ export class Astronauts {
     // rig is ever scaled again.
     const R = P.helmetR
 
-    // Helmet shell.
-    const helmetGeo = new THREE.SphereGeometry(R, 16, 11)
-    parts.helmet = this._mesh(helmetGeo, suit(0.26, { metalness: 0.03, envMapIntensity: 1.35 }), capacity, false)
-
-    // Visor: a dark screen wrapped onto the helmet. The patch itself is a rectangle in UV
-    // space, so its rounded silhouette is cut in the fragment shader instead — a squircle
-    // SDF, which gives soft corners a rectangular patch can never have, and lets the white
-    // helmet show through where the screen ends.
-    const visorGeo = sphereCap(R * 1.032, 2.45, Math.PI * 0.62, 20, 14)
-    parts.visor = this._mesh(visorGeo, this._visorMaterial(), capacity, false)
-
     // Backpack + a life-support cylinder on each side.
     const packGeo = roundedBox(R * 0.89, R * 0.98, R * 0.55, R * 0.19)
     parts.pack = this._mesh(packGeo, suit(0.66), capacity, true)
@@ -197,18 +212,19 @@ export class Astronauts {
     // than suit white, so it reads as a tool at the distance the colony is watched from.
     parts.hammer = this._mesh(hammerGeometry(R), suit(0.62, { vertexColors: true }), capacity, true)
 
-    // Face: the features only, drawn straight onto the visor beneath. Built as a sphere cap
-    // a hair larger than the visor, so it lies exactly on the curved surface instead of
-    // clipping through it — a flat plane at this radius sinks inside the sphere and the
-    // features disappear.
-    const faceGeo = sphereCap(P.helmetR * 1.047, 1.72, 0.98, 16, 10)
-    parts.face = this._mesh(faceGeo, this._faceMaterial(), capacity, false)
-    this._attachFrameAttribute(parts.face, capacity)
-
     for (const mesh of Object.values(parts)) {
       mesh.frustumCulled = false // one bounding volume for every agent everywhere is useless
       this.group.add(mesh)
     }
+
+    // The helmet, the visor and the face are the worn parts big enough to matter at a
+    // distance, so those come in two resolutions, alongside the two bodies: one set for
+    // builders near the camera and one for the rest. The materials are shared between the
+    // sets — only the geometry differs.
+    this.helmetMaterial = suit(0.26, { metalness: 0.03, envMapIntensity: 1.35 })
+    this.visorMaterial = this._visorMaterial()
+    this.faceMaterial = this._faceMaterial()
+    this.lods = [this._buildWorn(capacity, true), this._buildWorn(capacity, false)]
     this._applyShadowFlags()
 
     // Ground rings for hover + selection. Two ordinary meshes, moved around as needed.
@@ -220,7 +236,37 @@ export class Astronauts {
   }
 
   /**
-   * Hand over the baked crew rig and build the body mesh.
+   * One resolution of the parts that ride on the head: helmet shell, visor and face.
+   *
+   * The visor is a dark screen wrapped onto the helmet. The patch itself is a rectangle in
+   * UV space, so its rounded silhouette is cut in the fragment shader instead — a squircle
+   * SDF, which gives soft corners a rectangular patch can never have, and lets the white
+   * helmet show through where the screen ends. The face is the features only, drawn
+   * straight onto the visor beneath: a sphere cap a hair larger than the visor, so it lies
+   * exactly on the curved surface instead of clipping through it — a flat plane at this
+   * radius sinks inside the sphere and the features disappear.
+   *
+   * The coarse set has about a quarter of the triangles. Past the LOD line a helmet is a
+   * dozen pixels across, where a sphere of forty-eight faces and one of a hundred and
+   * seventy-six draw the same circle.
+   */
+  _buildWorn(capacity, fine) {
+    const R = P.helmetR
+    const helmet = this._mesh(new THREE.SphereGeometry(R, fine ? 16 : 8, fine ? 11 : 6), this.helmetMaterial, capacity, false)
+    const visor = this._mesh(sphereCap(R * 1.032, 2.45, Math.PI * 0.62, fine ? 20 : 8, fine ? 14 : 6), this.visorMaterial, capacity, false)
+    const face = this._mesh(sphereCap(R * 1.047, 1.72, 0.98, fine ? 16 : 8, fine ? 10 : 5), this.faceMaterial, capacity, false)
+    const frames = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 2), 2)
+    frames.setUsage(THREE.DynamicDrawUsage)
+    face.geometry.setAttribute('aFrame', frames)
+    for (const mesh of [helmet, visor, face]) {
+      mesh.frustumCulled = false
+      this.group.add(mesh)
+    }
+    return { helmet, visor, face, frames, crew: null, crewFrames: null, n: 0 }
+  }
+
+  /**
+   * Hand over the baked crew rig and build the body meshes.
    *
    * Split out from the constructor because the rig is a fetch: the colony is built before
    * boot has finished loading, and until this lands the crew is helmets and backpacks with
@@ -232,41 +278,45 @@ export class Astronauts {
     this.rig = rig
     this._disposeCrew()
 
-    const geo = rig.geometry.clone()
-    const frames = new Float32Array(this.capacity)
-    this.crewFrameAttr = new THREE.InstancedBufferAttribute(frames, 1)
-    this.crewFrameAttr.setUsage(THREE.DynamicDrawUsage)
-    geo.setAttribute('aFrame', this.crewFrameAttr)
-
     // One uniform block for the surface and the shadow pass, the same as the buildings do.
     this.crewUniforms = {
       uBones: { value: rig.boneTexture },
       uFrameMax: { value: rig.frameCount - 1 },
     }
 
-    const material = decorateSkinned(
+    this.crewMaterial = decorateSkinned(
       new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.68, metalness: 0.04 }),
       this.crewUniforms
     )
-
-    const mesh = new THREE.InstancedMesh(geo, material, this.capacity)
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
-    mesh.count = 0
-    mesh.receiveShadow = false
-    mesh.frustumCulled = false
-    const white = new THREE.Color(1, 1, 1)
-    for (let i = 0; i < this.capacity; i++) mesh.setColorAt(i, white)
-    mesh.instanceColor.setUsage(THREE.DynamicDrawUsage)
-
-    const depth = decorateSkinned(
+    this.crewDepth = decorateSkinned(
       new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking }),
       this.crewUniforms,
       { normals: false }
     )
-    mesh.customDepthMaterial = depth
 
-    this.crew = mesh
-    this.group.add(mesh)
+    // Two bodies from one bake: the mannequin as authored, and its clustered copy for the
+    // builders far from the camera. Same material, same bone table, same frame attribute;
+    // only the vertex count differs, and `_writeMatrices` decides who goes in which.
+    this.lods.forEach((lod, k) => {
+      const geo = (k === 0 ? rig.geometry : rig.geometryFar || rig.geometry).clone()
+      const frames = new THREE.InstancedBufferAttribute(new Float32Array(this.capacity), 1)
+      frames.setUsage(THREE.DynamicDrawUsage)
+      geo.setAttribute('aFrame', frames)
+
+      const mesh = new THREE.InstancedMesh(geo, this.crewMaterial, this.capacity)
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+      mesh.count = 0
+      mesh.receiveShadow = false
+      mesh.frustumCulled = false
+      const white = new THREE.Color(1, 1, 1)
+      for (let i = 0; i < this.capacity; i++) mesh.setColorAt(i, white)
+      mesh.instanceColor.setUsage(THREE.DynamicDrawUsage)
+      mesh.customDepthMaterial = this.crewDepth
+
+      lod.crew = mesh
+      lod.crewFrames = frames
+      this.group.add(mesh)
+    })
     this._applyShadowFlags()
 
     // Bones anything worn hangs off. Read back per frame from the same baked table the
@@ -283,12 +333,35 @@ export class Astronauts {
   }
 
   _disposeCrew() {
-    if (!this.crew) return
-    this.group.remove(this.crew)
-    this.crew.geometry.dispose()
-    this.crew.material.dispose()
-    this.crew.customDepthMaterial?.dispose()
-    this.crew = null
+    for (const lod of this.lods) {
+      if (!lod.crew) continue
+      this.group.remove(lod.crew)
+      lod.crew.geometry.dispose()
+      lod.crew = null
+      lod.crewFrames = null
+    }
+    this.crewMaterial?.dispose()
+    this.crewDepth?.dispose()
+    this.crewMaterial = null
+    this.crewDepth = null
+  }
+
+  /** Take down every instanced part — the single-set ones and both resolutions of the rest. */
+  _disposeWorn() {
+    for (const mesh of Object.values(this.parts)) {
+      this.group.remove(mesh)
+      mesh.geometry.dispose()
+      mesh.material.dispose()
+    }
+    for (const lod of this.lods) {
+      for (const mesh of [lod.helmet, lod.visor, lod.face]) {
+        this.group.remove(mesh)
+        mesh.geometry.dispose()
+      }
+    }
+    this.helmetMaterial.dispose()
+    this.visorMaterial.dispose()
+    this.faceMaterial.dispose()
   }
 
   _mesh(geo, mat, count, castShadow) {
@@ -365,7 +438,6 @@ export class Astronauts {
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uFrameScale = { value: new THREE.Vector2(1 / FRAME_COLS, 1 / FRAME_ROWS) }
       shader.uniforms.uGlow = { value: 1.85 }
-      this._faceUniforms = shader.uniforms
 
       shader.vertexShader = shader.vertexShader
         .replace(
@@ -401,22 +473,18 @@ export class Astronauts {
     return mat
   }
 
-  _attachFrameAttribute(mesh, capacity) {
-    const data = new Float32Array(capacity * 2)
-    const attr = new THREE.InstancedBufferAttribute(data, 2)
-    attr.setUsage(THREE.DynamicDrawUsage)
-    mesh.geometry.setAttribute('aFrame', attr)
-    this.frameAttr = attr
-  }
-
   _applyShadowFlags() {
     const on = this.settings.shadowSize > 0
     for (const [name, mesh] of Object.entries(this.parts)) {
-      const wants = name !== 'face' && name !== 'tip' && name !== 'lamp' && name !== 'visor'
-      mesh.castShadow = on && wants
+      mesh.castShadow = on && name !== 'tip' && name !== 'lamp'
     }
-    // The body is the shadow that matters — it is the whole silhouette.
-    if (this.crew) this.crew.castShadow = on
+    for (const lod of this.lods) {
+      lod.helmet.castShadow = on
+      lod.visor.castShadow = false
+      lod.face.castShadow = false
+      // The body is the shadow that matters — it is the whole silhouette.
+      if (lod.crew) lod.crew.castShadow = on
+    }
   }
 
   /** The colony hands over the navigation grid once it has been built. */
@@ -429,8 +497,8 @@ export class Astronauts {
     if (changed.has('textureQuality')) {
       this.faceTexture.dispose()
       this.faceTexture = buildFaceAtlas(Math.min(this.settings.textureSize, 512))
-      this.parts.face.material.map = this.faceTexture
-      this.parts.face.material.needsUpdate = true
+      this.faceMaterial.map = this.faceTexture
+      this.faceMaterial.needsUpdate = true
     }
     if (changed.has('maxAgents')) {
       // The instanced buffers are sized at build time, so a bigger roster needs new ones.
@@ -438,17 +506,14 @@ export class Astronauts {
       if (wanted !== this.capacity) {
         const rig = this.rig
         this._disposeCrew()
-        for (const mesh of Object.values(this.parts)) {
-          this.group.remove(mesh)
-          mesh.geometry.dispose()
-          mesh.material.dispose()
-        }
+        this._disposeWorn()
         this.group.remove(this.hoverRing, this.selectRing)
         this._buildMeshes(wanted)
         this.rig = null
         this.setRig(rig)
         for (const agent of this.agents) {
           agent.index = -1
+          agent.lodSlot = -1
           agent.colorDirty = true
         }
       }
@@ -562,6 +627,11 @@ export class Astronauts {
       pathGoal: new THREE.Vector3(NaN, 0, NaN),
       colorDirty: true,
       index: -1,
+      // Which body it is drawn with (0 fine, 1 coarse), and its slot in that set last frame.
+      // Born coarse: the first frame measures the camera and promotes it if it is close.
+      lod: 1,
+      lodSlot: -1,
+      lodAt: -1,
       walkAmp: 0,
       screen: new THREE.Vector3(), // filled by the picker each frame
     }
@@ -639,7 +709,7 @@ export class Astronauts {
 
   // ── per-frame simulation ────────────────────────────────────────────────────────────
 
-  update(dt, elapsed) {
+  update(dt, elapsed, camera) {
     const reduced = this.settings.get('reducedMotion')
     const anim = reduced ? 0.35 : 1
     let write = 0
@@ -662,7 +732,7 @@ export class Astronauts {
       write++
     }
 
-    this._writeMatrices(elapsed, anim)
+    this._writeMatrices(elapsed, anim, camera)
     return write
   }
 
@@ -1138,10 +1208,10 @@ export class Astronauts {
 
   // ── writing the instance buffers ────────────────────────────────────────────────────
 
-  _writeMatrices(elapsed, anim) {
-    const { helmet, visor, pack, antenna, tip, lamp, face, hammer } = this.parts
+  _writeMatrices(elapsed, anim, camera) {
+    const { pack, antenna, tip, lamp, hammer } = this.parts
+    const lods = this.lods
     const rig = this.rig
-    const crew = this.crew
     const root = this._m
     const child = this._m2
     const bone = this._m3
@@ -1150,9 +1220,10 @@ export class Astronauts {
     const e = this._e
     const v = this._v
     const one = this._one
-    const frames = this.frameAttr.array
-    const crewFrames = this.crewFrameAttr?.array
+    const cam = camera?.position
 
+    for (const lod of lods) lod.n = 0
+    const lodDirty = [false, false]
     let i = 0
     let hands = 0
     let staticDirty = false
@@ -1171,6 +1242,19 @@ export class Astronauts {
       const s = agent.scale
       if (s <= 0.001) continue
 
+      // Which body this builder gets this frame: hysteretic on its distance to the camera,
+      // so one standing right on the line does not flicker between the two.
+      if (cam) {
+        const dx = agent.pos.x - cam.x
+        const dy = agent.pos.y - cam.y
+        const dz = agent.pos.z - cam.z
+        const d2 = dx * dx + dy * dy + dz * dz
+        if (agent.lod === 1 && d2 < LOD_NEAR * LOD_NEAR) agent.lod = 0
+        else if (agent.lod === 0 && d2 > LOD_FAR * LOD_FAR) agent.lod = 1
+      }
+      const lod = lods[agent.lod]
+      const j = lod.n++
+
       // Root transform for the whole character. The rig is authored at 2.2 units tall, so
       // CREW_SCALE rides along here and everything downstream inherits it.
       e.set(0, agent.yaw, 0)
@@ -1179,9 +1263,9 @@ export class Astronauts {
       root.compose(v, q, one.setScalar(s * CREW_SCALE))
       one.setScalar(1)
 
-      if (crew) {
-        crew.setMatrixAt(i, root)
-        crewFrames[i] = agent.frame
+      if (lod.crew) {
+        lod.crew.setMatrixAt(j, root)
+        lod.crewFrames.array[j] = agent.frame
       }
 
       // Everything worn hangs off a bone at the frame the body is actually on, so a helmet
@@ -1189,9 +1273,9 @@ export class Astronauts {
       if (rig) {
         attachMatrixAt(rig, agent.frame, this.headSlot, bone)
         worn.multiplyMatrices(root, bone)
-        setPart(child, worn, helmet, i, 0, P.headUp, 0, 0, 0, 0)
-        setPart(child, worn, visor, i, 0, P.headUp, 0, 0, 0, 0)
-        setPart(child, worn, face, i, 0, P.headUp, 0, 0, 0, 0)
+        setPart(child, worn, lod.helmet, j, 0, P.headUp, 0, 0, 0, 0)
+        setPart(child, worn, lod.visor, j, 0, P.headUp, 0, 0, 0, 0)
+        setPart(child, worn, lod.face, j, 0, P.headUp, 0, 0, 0, 0)
         setPart(child, worn, antenna, i, P.antX, P.antY, P.antZ, 0.06, 0, -0.12)
         setPart(child, worn, tip, i, P.tipX, P.tipY, P.antZ, 0, 0, 0)
 
@@ -1209,17 +1293,21 @@ export class Astronauts {
         }
       }
 
-      // Suit and trim only change when the status does, or when an agent leaving the roster
-      // shuffles everyone's slot along — so they are written on those frames, not all of them.
+      // Suit and trim only change when the status does, or when a slot moves — in the
+      // single set because somebody ahead left the roster, in a body set because somebody
+      // crossed the LOD line — so they are written on those frames, not all of them.
       const c = this._color
       if (agent.index !== i || agent.colorDirty) {
-        agent.colorDirty = false
-        crew?.setColorAt(i, c.setHex(agent.suit))
-        helmet.setColorAt(i, c.setHex(agent.suit))
         pack.setColorAt(i, agent.trim)
-        face.setColorAt(i, agent.eye)
         staticDirty = true
       }
+      if (agent.lodSlot !== j || agent.lodAt !== agent.lod || agent.colorDirty) {
+        lod.crew?.setColorAt(j, c.setHex(agent.suit))
+        lod.helmet.setColorAt(j, c.setHex(agent.suit))
+        lod.face.setColorAt(j, agent.eye)
+        lodDirty[agent.lod] = true
+      }
+      agent.colorDirty = false
 
       // Antenna tip and chest lamp pulse; a blocked agent's lamp stutters like a fault light.
       const pulse =
@@ -1231,28 +1319,33 @@ export class Astronauts {
 
       // Atlas frame for the face.
       const f = agent.faceFrame
-      frames[i * 2] = (f % FRAME_COLS) / FRAME_COLS
-      frames[i * 2 + 1] = 1 - (Math.floor(f / FRAME_COLS) + 1) / FRAME_ROWS
+      const frames = lod.frames.array
+      frames[j * 2] = (f % FRAME_COLS) / FRAME_COLS
+      frames[j * 2 + 1] = 1 - (Math.floor(f / FRAME_COLS) + 1) / FRAME_ROWS
 
       agent.index = i
+      agent.lodSlot = j
+      agent.lodAt = agent.lod
       i++
     }
 
     const n = i
     // The glowing parts pulse every frame; the rest only re-upload when something moved slot.
-    const animated = new Set(['tip', 'lamp'])
     for (const [name, mesh] of Object.entries(this.parts)) {
       mesh.count = name === 'hammer' ? hands : n
       mesh.instanceMatrix.needsUpdate = true
-      if (mesh.instanceColor && (staticDirty || animated.has(name))) mesh.instanceColor.needsUpdate = true
+      if (mesh.instanceColor && (staticDirty || ANIMATED_PARTS.has(name))) mesh.instanceColor.needsUpdate = true
     }
-    if (crew) {
-      crew.count = n
-      crew.instanceMatrix.needsUpdate = true
-      this.crewFrameAttr.needsUpdate = true
-      if (staticDirty && crew.instanceColor) crew.instanceColor.needsUpdate = true
-    }
-    this.frameAttr.needsUpdate = true
+    lods.forEach((lod, k) => {
+      for (const mesh of [lod.helmet, lod.visor, lod.face, lod.crew]) {
+        if (!mesh) continue
+        mesh.count = lod.n
+        mesh.instanceMatrix.needsUpdate = true
+        if (lodDirty[k] && mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+      }
+      lod.frames.needsUpdate = true
+      if (lod.crewFrames) lod.crewFrames.needsUpdate = true
+    })
     this.visibleCount = n
   }
 
@@ -1362,10 +1455,7 @@ export class Astronauts {
   }
 
   dispose() {
-    for (const mesh of Object.values(this.parts)) {
-      mesh.geometry.dispose()
-      mesh.material.dispose()
-    }
+    this._disposeWorn()
     this._disposeCrew()
     // The bone texture is the rig's, not this instance's — the rig outlives any one colony.
     this.faceTexture.dispose()

@@ -492,7 +492,10 @@ The knobs that actually matter, and why:
   hardest exactly when you lean in to read them.
 - **Adaptive quality** watches the frame time and quietly scales *under* whatever you chose,
   one step per second — a governor that reacts per frame makes the resolution visibly breathe.
-  Its floor is relative too: half of what your display can show, not half a CSS pixel.
+  Its floor is relative too: half of what your display can show, not half a CSS pixel. It
+  only calls a scale settled when the panel's own frame rate holds at it: the old floor of
+  45 fps let a machine sit at fifty for as long as the window was open, which on a 60 Hz
+  panel is a doubled frame every few and reads as stutter rather than as slowness.
 - **HDR + bloom** off doesn't just skip the pass, it disposes the composer's float render
   targets. Turning it off on a weak machine gives the memory back.
 - **Shadows** track the camera rather than covering the whole colony, which is worth roughly a
@@ -505,6 +508,19 @@ What keeps it cheap at rest:
   sixty-fifth astronaut costs a matrix write and one float, not a draw call. Per-agent suit
   colour, eye colour and facial expression ride along as instanced attributes.
   Measured on a live colony: **66 astronauts and 66 buildings in 105 draw calls**.
+- The crew also comes in two resolutions. The mannequin is six thousand triangles, and from
+  the resting overview a builder is twenty pixels tall: fifteen triangles to the pixel, each
+  shaded as a whole 2×2 quad by the rasteriser, twice a frame once the shadow pass is counted.
+  Profiled on an integrated GPU, that was the single largest cost in the frame — more than
+  the ground. Past thirty units from the camera the body and the head's parts come from a
+  clustered copy at a fifth of the triangles (`FAR_CELL` in `src/agents/crew.js`); inside
+  twenty-six, the fine ones come back. The switch has a gap in it so nobody flickers.
+- The sky is drawn *last*, depth-tested, with its depth pushed to the far plane. Drawn first
+  with the test off — the usual way — it shaded every pixel of the frame and then had the
+  ground painted over most of it.
+- The tilt-shift blurs at half resolution into targets of its own, with as many taps as the
+  radius actually needs, and its composite is where tone mapping and sRGB happen, so the
+  composer's output pass is off while it runs. Bloom's own buffers are 70% of the frame.
 - Each building merges into a single geometry, and construction progress is a shader offset
   rather than a rebuild, so a building rises out of the ground without touching a vertex
   buffer. It sinks the structure and discards what falls below the deck rather than slicing
@@ -513,6 +529,31 @@ What keeps it cheap at rest:
 - Terrain is displaced and vertex-coloured once at build time; the GPU only ever sees static
   geometry.
 - Particles live in flat typed arrays and are swap-removed on death — no allocation during play.
+
+### Measuring it
+
+```sh
+npm run build && npm run profile
+```
+
+That loads the built page in a headless Chrome against a synthetic roster of 65 threads —
+nothing real is scanned, and nothing in `.env` is read — takes over the frame loop, and
+brackets every render with a GPU timer query. It reports GPU milliseconds per frame with
+each effect switched off in turn, then each post-processing pass on its own. `npm run shot`
+does the same with screenshots, at a few fixed views and times of day.
+
+**Read the first line first.** It names the chip the browser is actually drawing with. This
+was built on a laptop with a GeForce and an Intel UHD 630, and the browser was using the
+Intel one — Windows hands a browser the power-saving GPU unless told otherwise, and there is
+nothing a page can do about it. Every number below it was several times what the machine
+could do, and the render scale settling in the fifties was that, not the island. The fix is
+in Windows: *Settings → System → Display → Graphics*, add the browser, set it to *High
+performance*. The HUD says as much, once, if the governor has had to back off on an
+integrated part.
+
+For the record, on that Intel UHD 630 at 1900×963 with 65 builders and 65 buildings, the
+balanced preset went from 35.0 ms a frame to 24.4 ms across the changes listed above, and
+from 1.26 million triangles to 0.57 million.
 
 ### Things that hold their size on screen
 

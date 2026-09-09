@@ -293,6 +293,25 @@ const actions = {
 }
 
 const hud = new Hud(app, settings, actions)
+
+/**
+ * Say which chip is drawing the page, once, if the governor has had to back off on it.
+ *
+ * Profiled, the machine this was built on has two GPUs and the browser was using the slow
+ * one — the render scale settling in the fifties was that, not the island. A page cannot
+ * pick its GPU; the only lever is a setting in Windows, and the only useful thing to do is
+ * to name the chip so somebody knows to look. Only integrated parts are named, and only
+ * when the scale actually dropped: a machine holding full resolution has nothing to hear.
+ */
+let gpuHinted = false
+engine.onAutoScaled = () => {
+  if (gpuHinted) return
+  const gpu = engine.gpuName
+  if (!/intel|iris|uhd|vega|radeon\(tm\) graphics|apple m|adreno|mali/i.test(gpu)) return
+  gpuHinted = true
+  const name = gpu.replace(/^ANGLE \(\w+, /, '').replace(/ Direct3D.*$/, '').replace(/\(0x[0-9a-f]+\)/i, '').trim()
+  hud.hint(`Drawing on ${name}, below full resolution — on a laptop with a second GPU, set your browser to High performance in Windows Graphics settings`, 11000)
+}
 // The sidebar is permanent, so the card beside an astronaut has a wall to stay clear of.
 const sideWidth = () => (window.innerWidth <= 820 ? 0 : 334)
 hud.setSideWidth(sideWidth())

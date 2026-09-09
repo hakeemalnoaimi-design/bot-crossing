@@ -33,6 +33,20 @@ const BAKE_FPS = 30
 const TEXELS_PER_BONE = 4
 
 /**
+ * How coarse the far body is, in the rig's own units.
+ *
+ * The mannequin is 5,950 triangles for a body 1.24 units tall. Seen from the resting
+ * overview a builder is twenty pixels high, which puts fifteen triangles on every pixel —
+ * and a rasteriser shades each of those as a whole 2×2 quad, twice a frame once the shadow
+ * pass is counted. Measured on an integrated GPU that was the single largest cost in the
+ * frame, more than the ground, for detail that could not be seen. So the body is also kept
+ * as a clustered copy: vertices snapped to a grid this fine and merged, which takes it to
+ * about 1,100 triangles while keeping every limb where it was. `astronauts.js` draws
+ * whichever of the two the camera is far enough away for.
+ */
+const FAR_CELL = 0.1
+
+/**
  * Bones the colony hangs things off. Their *world* transforms are baked into a small
  * side-table on the CPU as well, because a helmet does not want the skinning matrix — it
  * wants to know where the head actually is. Three bones over the whole animation set is a
@@ -101,9 +115,109 @@ async function bake(dropMeshes = DROP_MESHES) {
   const boneIndex = new Map(bones.map((b, i) => [b.name, i]))
 
   const geometry = mergeBody(skinned, dropMeshes)
+  const geometryFar = clusterDecimate(geometry, FAR_CELL)
   const bake = bakeClips(root, skeleton, skinned[0], gltf.animations)
 
-  return { geometry, bones, boneIndex, ...bake }
+  return { geometry, geometryFar, bones, boneIndex, ...bake }
+}
+
+/**
+ * Vertex-clustering decimation, for a skinned mesh.
+ *
+ * Every vertex is binned into a cube `cell` across; each bin becomes one vertex at the
+ * centroid of what fell into it, and a triangle survives only if its three corners landed
+ * in three different bins. Skin indices and weights are taken from the vertex nearest the
+ * bin's centroid, so the coarse body follows the same bones the fine one does, and the
+ * normals are recomputed from the new surface rather than averaged from the old one.
+ *
+ * Crude next to an edge-collapse simplifier, and the right tool here: it needs no raw
+ * asset pack and no native library, runs once at boot in a few milliseconds, and its only
+ * failure mode is blockiness — on a figure drawn twenty pixels tall, blockiness is free.
+ */
+function clusterDecimate(src, cell) {
+  const pos = src.attributes.position
+  const skinIndex = src.attributes.skinIndex
+  const skinWeight = src.attributes.skinWeight
+  const index = src.index ? src.index.array : null
+  const n = pos.count
+
+  const binOf = new Int32Array(n)
+  const bins = new Map()
+  const sum = []
+  for (let i = 0; i < n; i++) {
+    const x = pos.getX(i)
+    const y = pos.getY(i)
+    const z = pos.getZ(i)
+    const key = `${Math.floor(x / cell)},${Math.floor(y / cell)},${Math.floor(z / cell)}`
+    let b = bins.get(key)
+    if (b === undefined) {
+      b = sum.length
+      bins.set(key, b)
+      sum.push([0, 0, 0, 0])
+    }
+    binOf[i] = b
+    const s = sum[b]
+    s[0] += x
+    s[1] += y
+    s[2] += z
+    s[3] += 1
+  }
+
+  // The vertex nearest each centroid speaks for the bin's skinning.
+  const rep = new Int32Array(sum.length).fill(-1)
+  const repDist = new Float32Array(sum.length).fill(Infinity)
+  for (let i = 0; i < n; i++) {
+    const b = binOf[i]
+    const s = sum[b]
+    const dx = pos.getX(i) - s[0] / s[3]
+    const dy = pos.getY(i) - s[1] / s[3]
+    const dz = pos.getZ(i) - s[2] / s[3]
+    const d = dx * dx + dy * dy + dz * dz
+    if (d < repDist[b]) {
+      repDist[b] = d
+      rep[b] = i
+    }
+  }
+
+  const triangles = index ? index.length / 3 : n / 3
+  const out = []
+  const seen = new Set()
+  for (let t = 0; t < triangles; t++) {
+    const a = binOf[index ? index[t * 3] : t * 3]
+    const b = binOf[index ? index[t * 3 + 1] : t * 3 + 1]
+    const c = binOf[index ? index[t * 3 + 2] : t * 3 + 2]
+    if (a === b || b === c || a === c) continue
+    // Several fine triangles collapse onto the same coarse one; keep the first.
+    const key = a < b ? (b < c ? `${a},${b},${c}` : a < c ? `${a},${c},${b}` : `${c},${a},${b}`) : a < c ? `${b},${a},${c}` : b < c ? `${b},${c},${a}` : `${c},${b},${a}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(a, b, c)
+  }
+
+  const count = sum.length
+  const position = new Float32Array(count * 3)
+  const si = new Float32Array(count * 4)
+  const sw = new Float32Array(count * 4)
+  for (let b = 0; b < count; b++) {
+    const s = sum[b]
+    position[b * 3] = s[0] / s[3]
+    position[b * 3 + 1] = s[1] / s[3]
+    position[b * 3 + 2] = s[2] / s[3]
+    const r = rep[b]
+    for (let k = 0; k < 4; k++) {
+      si[b * 4 + k] = skinIndex.getComponent(r, k)
+      sw[b * 4 + k] = skinWeight.getComponent(r, k)
+    }
+  }
+
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(position, 3))
+  geo.setAttribute('skinIndex', new THREE.BufferAttribute(si, 4))
+  geo.setAttribute('skinWeight', new THREE.BufferAttribute(sw, 4))
+  geo.setIndex(out)
+  geo.computeVertexNormals()
+  geo.computeBoundingBox()
+  return geo
 }
 
 /**

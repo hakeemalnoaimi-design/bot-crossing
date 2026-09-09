@@ -18,6 +18,10 @@ const SKY_VERT = /* glsl */ `
     // The dome is pinned to the camera, so it can never be walked out of.
     vec4 mv = modelViewMatrix * vec4( position, 1.0 );
     gl_Position = projectionMatrix * mv;
+    // Pushed to the far plane, a hair inside it, so that wherever anything at all has
+    // already been drawn the depth test throws the sky away before it is shaded. The dome
+    // is drawn last for exactly that reason — see \`_buildDome\`.
+    gl_Position.z = gl_Position.w * 0.999999;
   }
 `
 
@@ -273,11 +277,18 @@ export class Sky {
       fragmentShader: SKY_FRAG,
       side: THREE.BackSide,
       depthWrite: false,
-      depthTest: false,
+      // Tested against the depth buffer, and drawn *after* every other opaque thing rather
+      // than first. The old order — sky first, with the test off — shaded the whole frame
+      // as sky and then painted the ground over most of it, which on an integrated GPU was
+      // a measurable slice of every frame spent on pixels nobody ever saw. Drawn last, with
+      // its depth pushed to the far plane in the vertex stage, only the sky that is actually
+      // visible gets shaded. Stars, the moon's halo and every label are transparent, so they
+      // still land on top of it.
+      depthTest: true,
       fog: false,
     })
     this.dome = new THREE.Mesh(geo, mat)
-    this.dome.renderOrder = -1000
+    this.dome.renderOrder = 900
     this.dome.frustumCulled = false
     this.dome.scale.setScalar(400)
     this.group.add(this.dome)

@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js'
+import { FullScreenQuad, Pass } from 'three/addons/postprocessing/Pass.js'
 
 /**
  * Tilt-shift as an actual lens rather than as a filter.
@@ -24,182 +24,368 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js'
  * The miniature illusion comes from the depth of field being far too shallow for the size of
  * the thing you are looking at — your eye reads that as "small and close", not "large and far".
  *
- * ── Why the two passes differ ──
- * A separable gaussian is 2n taps rather than n², so this is a horizontal pass then a vertical
- * one. Only the first reads depth; the second takes the blur amount it computed out of the
- * alpha channel. That is not a micro-optimisation, it is a correctness requirement: after the
- * first pass the composer has swapped buffers, and the target the second pass draws into is
- * the very one the depth texture is attached to. Sampling it there would be a feedback loop.
+ * ── How it is laid out ──
+ * Three draws, one pass. The blur is separable — a horizontal gather then a vertical one, 2n
+ * taps rather than n² — and both halves run at **half resolution** into targets of their own:
+ * an out-of-focus pixel is by definition one with no detail worth keeping, so blurring it at
+ * full resolution was paying four times over for nothing. Only the first half reads depth;
+ * the second takes the blur amount it computed out of the alpha channel. The third draw puts
+ * the picture back together at full size — the sharp frame where the lens is focused, the
+ * blurred one where it is not — and, since it is writing a full-resolution frame anyway, it
+ * is also where tone mapping and the sRGB transfer happen, so the composer's own output pass
+ * has nothing left to do and is switched off while this runs. On an integrated GPU that is
+ * two passes over the whole frame that no longer exist.
+ *
+ * The blur is done in linear HDR, after bloom: blurring before it would drop out-of-focus
+ * highlights below the bloom threshold and switch the glow off exactly where the eye expects
+ * the most of it.
  */
 
 /** The widest the blur ever gets, as a share of frame height, at full strength. */
 const MAX_RADIUS = 0.02
 
-const common = {
-  uniforms: {
-    tDiffuse: { value: null },
-    tDepth: { value: null },
-    uTexel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
-    /** (1,0) horizontal, (0,1) vertical. */
-    uAxis: { value: new THREE.Vector2(1, 0) },
-    /** Blur radius in pixels for a pixel fully out of focus. */
-    uMaxRadius: { value: 8 },
-    /** Distance from the camera to the plane of focus, in world units. */
-    uFocusDistance: { value: 30 },
-    /** How far from that plane a pixel has to be before it is blurred as hard as it gets. */
-    uFocusRange: { value: 20 },
-    /** Plane-of-focus tilt in radians. 0 is square to the view, as an ordinary lens is. */
-    uTilt: { value: 0 },
-    uNear: { value: 0.1 },
-    uFar: { value: 500 },
-    uTanHalfFov: { value: Math.tan(THREE.MathUtils.degToRad(38) / 2) },
-    uAspect: { value: 1 },
-  },
-  vertexShader: /* glsl */ `
-    varying vec2 vUv;
-    void main() {
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+/** How many full-resolution pixels of blur it takes before the soft copy is used outright. */
+const BLEND_FROM = 0.5
+const BLEND_TO = 2.0
+
+const VERT = /* glsl */ `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+  }
+`
+
+const BLUR_FRAG = /* glsl */ `
+  uniform sampler2D tDiffuse;
+  uniform vec2 uTexel;
+  uniform vec2 uAxis;
+  uniform float uMaxRadius;
+  varying vec2 vUv;
+
+  #ifdef COC_FROM_DEPTH
+    uniform sampler2D tDepth;
+    uniform float uFocusDistance;
+    uniform float uFocusRange;
+    uniform float uTilt;
+    uniform float uNear;
+    uniform float uFar;
+    uniform float uTanHalfFov;
+    uniform float uAspect;
+
+    /** Window depth back to view space. Negative in front of the camera. */
+    float viewZOf( float depth ) {
+      float ndc = depth * 2.0 - 1.0;
+      return -( 2.0 * uNear * uFar ) / ( uFar + uNear - ndc * ( uFar - uNear ) );
     }
-  `,
-  fragmentShader: /* glsl */ `
-    uniform sampler2D tDiffuse;
-    uniform vec2 uTexel;
-    uniform vec2 uAxis;
-    uniform float uMaxRadius;
-    varying vec2 vUv;
 
+    float circleOfConfusion() {
+      float depth = texture2D( tDepth, vUv ).x;
+
+      // An unbound depth texture samples as 0, which is the near plane — a distance
+      // nothing is ever drawn at. Treating that as "no depth available, leave it sharp"
+      // means a half-wired frame shows the scene rather than a full-screen smear.
+      if ( depth <= 0.0 ) return 0.0;
+
+      // The sky is at the far plane and has no business anchoring focus — it is simply the
+      // furthest thing there is, so it takes the maximum blur and stays there.
+      if ( depth >= 0.9999 ) return 1.0;
+
+      float dist = -viewZOf( depth );
+
+      // Rebuild the view-space point. A tilted plane is only meaningful against a real
+      // position; measuring along the view axis alone would ignore the tilt entirely.
+      vec2 ndc = vUv * 2.0 - 1.0;
+      vec3 viewPos = vec3( ndc.x * uTanHalfFov * uAspect, ndc.y * uTanHalfFov, -1.0 ) * dist;
+
+      // Signed distance to the plane of focus, tilted about the horizontal axis.
+      vec3 planeNormal = vec3( 0.0, sin( uTilt ), cos( uTilt ) );
+      float signedDist = dot( viewPos - vec3( 0.0, 0.0, -uFocusDistance ), planeNormal );
+
+      return clamp( abs( signedDist ) / max( uFocusRange, 0.0001 ), 0.0, 1.0 );
+    }
+  #endif
+
+  /**
+   * Taps per side, at most. Spacing is the radius over the step count, so the kernel
+   * stays properly sampled at every radius rather than the taps drifting apart as the
+   * blur widens — which is what turns a blur into visible copies of the picture.
+   *
+   * The count itself follows the radius: about one tap per pixel, and never more. At the
+   * default strength the widest this blur ever gets is a couple of pixels, and eight taps
+   * a side across two pixels were reading the same texels over and over. A wide radius
+   * still gets the full eight.
+   */
+  const int MAX_STEPS = 8;
+
+  void main() {
     #ifdef COC_FROM_DEPTH
-      uniform sampler2D tDepth;
-      uniform float uFocusDistance;
-      uniform float uFocusRange;
-      uniform float uTilt;
-      uniform float uNear;
-      uniform float uFar;
-      uniform float uTanHalfFov;
-      uniform float uAspect;
-
-      /** Window depth back to view space. Negative in front of the camera. */
-      float viewZOf( float depth ) {
-        float ndc = depth * 2.0 - 1.0;
-        return -( 2.0 * uNear * uFar ) / ( uFar + uNear - ndc * ( uFar - uNear ) );
-      }
-
-      float circleOfConfusion() {
-        float depth = texture2D( tDepth, vUv ).x;
-
-        // An unbound depth texture samples as 0, which is the near plane — a distance
-        // nothing is ever drawn at. Treating that as "no depth available, leave it sharp"
-        // means a half-wired frame shows the scene rather than a full-screen smear.
-        if ( depth <= 0.0 ) return 0.0;
-
-        // The sky is at the far plane and has no business anchoring focus — it is simply the
-        // furthest thing there is, so it takes the maximum blur and stays there.
-        if ( depth >= 0.9999 ) return 1.0;
-
-        float dist = -viewZOf( depth );
-
-        // Rebuild the view-space point. A tilted plane is only meaningful against a real
-        // position; measuring along the view axis alone would ignore the tilt entirely.
-        vec2 ndc = vUv * 2.0 - 1.0;
-        vec3 viewPos = vec3( ndc.x * uTanHalfFov * uAspect, ndc.y * uTanHalfFov, -1.0 ) * dist;
-
-        // Signed distance to the plane of focus, tilted about the horizontal axis.
-        vec3 planeNormal = vec3( 0.0, sin( uTilt ), cos( uTilt ) );
-        float signedDist = dot( viewPos - vec3( 0.0, 0.0, -uFocusDistance ), planeNormal );
-
-        return clamp( abs( signedDist ) / max( uFocusRange, 0.0001 ), 0.0, 1.0 );
-      }
+      float coc = circleOfConfusion();
+    #else
+      float coc = texture2D( tDiffuse, vUv ).a;
     #endif
 
-    /**
-     * Taps per side. Spacing is the radius over this, so the kernel stays properly sampled
-     * at every radius rather than the taps drifting apart as the blur widens — which is what
-     * turns a blur into visible copies of the picture.
-     */
-    const int STEPS = 8;
+    float radius = uMaxRadius * coc;
 
-    void main() {
-      #ifdef COC_FROM_DEPTH
-        float coc = circleOfConfusion();
-      #else
-        float coc = texture2D( tDiffuse, vUv ).a;
-      #endif
-
-      float radius = uMaxRadius * coc;
-
-      // Under about a third of a pixel there is nothing to gather that the centre tap does
-      // not already have, and the whole in-focus band takes this branch.
-      if ( radius < 0.35 ) {
-        gl_FragColor = vec4( texture2D( tDiffuse, vUv ).rgb, COC_OUT );
-        return;
-      }
-
-      vec2 unit = uAxis * uTexel;
-      // Sigma a third of the radius puts three standard deviations at the outermost tap, so
-      // what is being ignored is negligible rather than chopped off — a truncated gaussian
-      // is what gives a blur a hard edge.
-      float sigma = max( radius / 3.0, 0.0001 );
-      float twoSigmaSq = 2.0 * sigma * sigma;
-
-      vec4 sum = texture2D( tDiffuse, vUv );
-      float weight = 1.0;
-
-      for ( int i = 1; i <= STEPS; i++ ) {
-        float offset = ( float( i ) / float( STEPS ) ) * radius;
-        float w = exp( -( offset * offset ) / twoSigmaSq );
-        sum += texture2D( tDiffuse, vUv + unit * offset ) * w;
-        sum += texture2D( tDiffuse, vUv - unit * offset ) * w;
-        weight += 2.0 * w;
-      }
-
-      gl_FragColor = vec4( ( sum / weight ).rgb, COC_OUT );
+    // Under about a third of a pixel there is nothing to gather that the centre tap does
+    // not already have, and the whole in-focus band takes this branch.
+    if ( radius < 0.35 ) {
+      gl_FragColor = vec4( texture2D( tDiffuse, vUv ).rgb, coc );
+      return;
     }
-  `,
+
+    vec2 unit = uAxis * uTexel;
+    // Sigma a third of the radius puts three standard deviations at the outermost tap, so
+    // what is being ignored is negligible rather than chopped off — a truncated gaussian
+    // is what gives a blur a hard edge.
+    float sigma = max( radius / 3.0, 0.0001 );
+    float twoSigmaSq = 2.0 * sigma * sigma;
+    int steps = int( clamp( ceil( radius ), 2.0, float( MAX_STEPS ) ) );
+
+    vec3 sum = texture2D( tDiffuse, vUv ).rgb;
+    float weight = 1.0;
+
+    // Explicit level zero: the loop's exit varies per pixel, and a sampler that has to
+    // work out its own mip level inside such a loop has no derivatives to do it with.
+    // The targets have no mips anyway.
+    for ( int i = 1; i <= MAX_STEPS; i++ ) {
+      if ( i > steps ) break;
+      float offset = ( float( i ) / float( steps ) ) * radius;
+      float w = exp( -( offset * offset ) / twoSigmaSq );
+      sum += textureLod( tDiffuse, vUv + unit * offset, 0.0 ).rgb * w;
+      sum += textureLod( tDiffuse, vUv - unit * offset, 0.0 ).rgb * w;
+      weight += 2.0 * w;
+    }
+
+    gl_FragColor = vec4( sum / weight, coc );
+  }
+`
+
+// Three prepends its tone-mapping and colour-space functions to every fragment shader, so
+// the ones used below are already declared; including the chunks again redefines them.
+const COMPOSITE_FRAG = /* glsl */ `
+  uniform sampler2D tSharp;
+  uniform sampler2D tBlur;
+  uniform float uMaxRadiusFull;
+  varying vec2 vUv;
+
+  void main() {
+    vec4 soft = texture2D( tBlur, vUv );
+    vec3 sharp = texture2D( tSharp, vUv ).rgb;
+    // How many full-size pixels of blur this pixel is due. Under half a pixel the sharp
+    // frame is the better picture of it; past two, the soft one is.
+    float radius = soft.a * uMaxRadiusFull;
+    float t = smoothstep( ${BLEND_FROM.toFixed(2)}, ${BLEND_TO.toFixed(2)}, radius );
+    gl_FragColor = vec4( mix( sharp, soft.rgb, t ), 1.0 );
+
+    #ifdef LINEAR_TONE_MAPPING
+      gl_FragColor.rgb = LinearToneMapping( gl_FragColor.rgb );
+    #elif defined( REINHARD_TONE_MAPPING )
+      gl_FragColor.rgb = ReinhardToneMapping( gl_FragColor.rgb );
+    #elif defined( CINEON_TONE_MAPPING )
+      gl_FragColor.rgb = CineonToneMapping( gl_FragColor.rgb );
+    #elif defined( ACES_FILMIC_TONE_MAPPING )
+      gl_FragColor.rgb = ACESFilmicToneMapping( gl_FragColor.rgb );
+    #elif defined( AGX_TONE_MAPPING )
+      gl_FragColor.rgb = AgXToneMapping( gl_FragColor.rgb );
+    #elif defined( NEUTRAL_TONE_MAPPING )
+      gl_FragColor.rgb = NeutralToneMapping( gl_FragColor.rgb );
+    #endif
+
+    #ifdef SRGB_TRANSFER
+      gl_FragColor = sRGBTransferOETF( gl_FragColor );
+    #endif
+  }
+`
+
+const halfTarget = () =>
+  new THREE.WebGLRenderTarget(1, 1, {
+    type: THREE.HalfFloatType,
+    colorSpace: THREE.LinearSRGBColorSpace,
+    depthBuffer: false,
+    stencilBuffer: false,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+  })
+
+/**
+ * The pass. It reads the composer's read buffer, blurs a half-size copy sideways and then
+ * down, and composites the result over the sharp frame into the write buffer — or straight
+ * to the screen, finished, when the composer says it is the last thing running.
+ */
+class TiltShiftPass extends Pass {
+  constructor() {
+    super()
+    this.name = 'tilt-shift (+ output)'
+    this.needsSwap = true
+
+    this._rtA = halfTarget()
+    this._rtB = halfTarget()
+
+    const blurUniforms = () => ({
+      tDiffuse: { value: null },
+      tDepth: { value: null },
+      uTexel: { value: new THREE.Vector2(1 / 512, 1 / 512) },
+      /** (1,0) horizontal, (0,1) vertical. */
+      uAxis: { value: new THREE.Vector2(1, 0) },
+      /** Blur radius in half-size pixels for a pixel fully out of focus. */
+      uMaxRadius: { value: 4 },
+      /** Distance from the camera to the plane of focus, in world units. */
+      uFocusDistance: { value: 30 },
+      /** How far from that plane a pixel has to be before it is blurred as hard as it gets. */
+      uFocusRange: { value: 20 },
+      /** Plane-of-focus tilt in radians. 0 is square to the view, as an ordinary lens is. */
+      uTilt: { value: 0 },
+      uNear: { value: 0.1 },
+      uFar: { value: 500 },
+      uTanHalfFov: { value: Math.tan(THREE.MathUtils.degToRad(38) / 2) },
+      uAspect: { value: 1 },
+    })
+    this._blurH = new THREE.ShaderMaterial({
+      uniforms: blurUniforms(),
+      vertexShader: VERT,
+      fragmentShader: BLUR_FRAG,
+      defines: { COC_FROM_DEPTH: '' },
+      depthTest: false,
+      depthWrite: false,
+    })
+    this._blurV = new THREE.ShaderMaterial({
+      uniforms: blurUniforms(),
+      vertexShader: VERT,
+      fragmentShader: BLUR_FRAG,
+      depthTest: false,
+      depthWrite: false,
+    })
+    this._blurV.uniforms.uAxis.value.set(0, 1)
+
+    this._composite = new THREE.ShaderMaterial({
+      uniforms: {
+        tSharp: { value: null },
+        tBlur: { value: null },
+        uMaxRadiusFull: { value: 8 },
+      },
+      vertexShader: VERT,
+      fragmentShader: COMPOSITE_FRAG,
+      depthTest: false,
+      depthWrite: false,
+    })
+    this._toneMapping = null
+    this._outputColorSpace = null
+
+    this._quad = new FullScreenQuad(null)
+  }
+
+  /** Both blur halves take the same lens settings; this is the one place they are written. */
+  set(name, value) {
+    this._blurH.uniforms[name].value = value
+    this._blurV.uniforms[name].value = value
+  }
+
+  setSize(width, height) {
+    const w = Math.max(1, Math.ceil(width / 2))
+    const h = Math.max(1, Math.ceil(height / 2))
+    this._rtA.setSize(w, h)
+    this._rtB.setSize(w, h)
+    this._blurH.uniforms.uTexel.value.set(1 / w, 1 / h)
+    this._blurV.uniforms.uTexel.value.set(1 / w, 1 / h)
+  }
+
+  /**
+   * Tone mapping and colour space follow the renderer, the way three's own OutputPass
+   * does it, so a change of tone mapper in the settings reaches this pass too. Only rebuilt
+   * when one of them actually changes — a define is a recompile.
+   */
+  _syncOutput(renderer) {
+    if (this._toneMapping === renderer.toneMapping && this._outputColorSpace === renderer.outputColorSpace) return
+    this._toneMapping = renderer.toneMapping
+    this._outputColorSpace = renderer.outputColorSpace
+    const defines = {}
+    const tm = renderer.toneMapping
+    if (tm === THREE.LinearToneMapping) defines.LINEAR_TONE_MAPPING = ''
+    else if (tm === THREE.ReinhardToneMapping) defines.REINHARD_TONE_MAPPING = ''
+    else if (tm === THREE.CineonToneMapping) defines.CINEON_TONE_MAPPING = ''
+    else if (tm === THREE.ACESFilmicToneMapping) defines.ACES_FILMIC_TONE_MAPPING = ''
+    else if (tm === THREE.AgXToneMapping) defines.AGX_TONE_MAPPING = ''
+    else if (tm === THREE.NeutralToneMapping) defines.NEUTRAL_TONE_MAPPING = ''
+    if (renderer.outputColorSpace === THREE.SRGBColorSpace) defines.SRGB_TRANSFER = ''
+    this._composite.defines = defines
+    this._composite.needsUpdate = true
+  }
+
+  render(renderer, writeBuffer, readBuffer) {
+    // Sideways, into the first half-size target. This is the half that reads depth.
+    this._blurH.uniforms.tDiffuse.value = readBuffer.texture
+    renderer.setRenderTarget(this._rtA)
+    this._quad.material = this._blurH
+    this._quad.render(renderer)
+
+    // Then down, into the second. Never into a target the depth texture is attached to.
+    this._blurV.uniforms.tDiffuse.value = this._rtA.texture
+    renderer.setRenderTarget(this._rtB)
+    this._quad.material = this._blurV
+    this._quad.render(renderer)
+
+    // Back together at full size, finished if this is the last pass.
+    this._syncOutput(renderer)
+    this._composite.uniforms.tSharp.value = readBuffer.texture
+    this._composite.uniforms.tBlur.value = this._rtB.texture
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer)
+    if (this.clear) renderer.clear()
+    this._quad.material = this._composite
+    this._quad.render(renderer)
+  }
+
+  dispose() {
+    this._rtA.dispose()
+    this._rtB.dispose()
+    this._blurH.dispose()
+    this._blurV.dispose()
+    this._composite.dispose()
+    this._quad.dispose()
+  }
 }
 
 /**
- * The pair of passes, already oriented and already told which of them owns the depth read.
- * Kept together so the caller sets a size, a strength or a focus once and both halves agree —
- * a horizontal pass blurring harder than the vertical one reads as smearing, not as defocus.
+ * The pass, wrapped so the caller sets a size, a strength or a focus once and every half
+ * of it agrees — a horizontal blur working harder than the vertical one reads as smearing,
+ * not as defocus. `passes` is what the composer takes; there is one now, but the engine
+ * adds whatever is in the list.
  */
 export function createTiltShift() {
-  // The first pass computes the blur amount and hands it on in alpha; the second consumes it.
-  const horizontal = new ShaderPass({ ...common, defines: { COC_FROM_DEPTH: '', COC_OUT: 'coc' } })
-  const vertical = new ShaderPass({ ...common, defines: { COC_OUT: '1.0' } })
-  horizontal.uniforms.uAxis.value.set(1, 0)
-  vertical.uniforms.uAxis.value.set(0, 1)
-
-  const passes = [horizontal, vertical]
-  const set = (name, value) => {
-    for (const p of passes) p.uniforms[name].value = value
-  }
+  const pass = new TiltShiftPass()
+  const passes = [pass]
 
   let amount = 0.4
+  /** Height of the *full* frame in pixels; the blur runs at half of it. */
   let frameHeight = 1080
   let focusDistance = 30
 
   const applyDerived = () => {
-    set('uMaxRadius', amount * MAX_RADIUS * frameHeight)
-    set('uFocusDistance', focusDistance)
+    // The radius is authored against the full frame and the blur runs at half size, so the
+    // gather uses half the pixels — and the composite is told the full number, which is
+    // the one that decides whether a pixel is soft enough to take the blurred copy.
+    const full = amount * MAX_RADIUS * frameHeight
+    pass.set('uMaxRadius', full / 2)
+    pass._composite.uniforms.uMaxRadiusFull.value = full
+    pass.set('uFocusDistance', focusDistance)
     // The sharp slab is a share of how far away you are focused rather than a fixed depth,
     // so pulling the camera back does not drop the whole colony out of focus at once. Turning
     // the effect up makes it shallower as well as blurrier, which is what a wider aperture
     // actually does — doing only one of the two reads as a smeared photograph.
-    set('uFocusRange', focusDistance * (0.8 + (0.08 - 0.8) * amount))
+    pass.set('uFocusRange', focusDistance * (0.8 + (0.08 - 0.8) * amount))
   }
 
   return {
     passes,
     set enabled(on) {
-      for (const p of passes) p.enabled = on
+      pass.enabled = on
     },
     get enabled() {
-      return horizontal.enabled
+      return pass.enabled
     },
-    /** The depth the scene was drawn with — see the note about which pass may read it. */
+    /** The depth the scene was drawn with — read by the first blur half only. */
     setDepthTexture(texture) {
-      horizontal.uniforms.tDepth.value = texture
+      pass._blurH.uniforms.tDepth.value = texture
     },
     /** 0..1, where 1 is `MAX_RADIUS` of frame height and the shallowest focus. */
     setStrength(v) {
@@ -208,7 +394,7 @@ export function createTiltShift() {
     },
     /** Degrees, so the caller and the settings panel agree on the unit. */
     setAngle(degrees) {
-      set('uTilt', (degrees * Math.PI) / 180)
+      pass.set('uTilt', (degrees * Math.PI) / 180)
     },
     /** Whatever the view is orbiting is what should be sharp. */
     setFocusDistance(distance) {
@@ -217,10 +403,10 @@ export function createTiltShift() {
     },
     /** Projection terms, needed to turn a depth sample back into a view-space position. */
     setCamera(camera) {
-      set('uNear', camera.near)
-      set('uFar', camera.far)
-      set('uAspect', camera.aspect)
-      set('uTanHalfFov', Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2))
+      pass.set('uNear', camera.near)
+      pass.set('uFar', camera.far)
+      pass.set('uAspect', camera.aspect)
+      pass.set('uTanHalfFov', Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2))
     },
     /**
      * Texel size follows the drawing buffer so a step of N pixels really is N pixels, and the
@@ -229,7 +415,7 @@ export function createTiltShift() {
      */
     setSize(width, height) {
       frameHeight = Math.max(1, height)
-      for (const p of passes) p.uniforms.uTexel.value.set(1 / Math.max(1, width), 1 / frameHeight)
+      pass.setSize(width, height)
       applyDerived()
     },
   }
