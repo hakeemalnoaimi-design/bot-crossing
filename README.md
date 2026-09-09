@@ -588,8 +588,11 @@ What keeps it cheap at rest:
   with the test off — the usual way — it shaded every pixel of the frame and then had the
   ground painted over most of it.
 - The tilt-shift blurs at half resolution into targets of its own, with as many taps as the
-  radius actually needs, and its composite is where tone mapping and sRGB happen, so the
-  composer's output pass is off while it runs. Bloom's own buffers are 70% of the frame.
+  radius actually needs. Its composite also does tone mapping and sRGB, saving a second pass
+  over every pixel — but **only while it is the last pass in the chain**, because three
+  compiles a material to tone map only when that material draws to the screen. Switch
+  antialiasing on and SMAA follows it, so the composite writes into a render target, stays
+  linear, and the output pass does the job instead. Bloom's own buffers are 70% of the frame.
 - Each building merges into a single geometry, and construction progress is a shader offset
   rather than a rebuild, so a building rises out of the ground without touching a vertex
   buffer. It sinks the structure and discards what falls below the deck rather than slicing

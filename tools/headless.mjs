@@ -5,11 +5,36 @@
  * Nothing in here touches the real server. The page is served by `profile-server.mjs`,
  * which answers with fake threads and keeps no state past the process.
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { startServer } from './profile-server.mjs'
+
+/**
+ * Stop a browser and everything it started.
+ *
+ * A browser is a process *tree* — a GPU process, a renderer per tab, a handful of utility
+ * processes — and killing only the one we spawned leaves the rest running, holding on to
+ * the GPU. Left to accumulate over a run of these tools they turn every later measurement
+ * into a measurement of them: twenty-nine strays were once responsible for the frame time
+ * more than doubling between two runs of the profiler.
+ */
+function killTree(pid) {
+  if (!pid) return
+  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
+  else {
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
 
 /** Chrome or Edge, wherever this machine keeps one. `CHROME` in the environment wins. */
 export function findChrome() {
@@ -95,12 +120,13 @@ export async function openApp({ threads = 65, port = 5399, debugPort = 9333, wid
     `--user-data-dir=${profileDir}`,
     'about:blank',
   ]
-  const chrome = spawn(findChrome(), flags, { stdio: 'ignore' })
+  const chrome = spawn(findChrome(), flags, { stdio: 'ignore', detached: process.platform !== 'win32' })
 
+  let closed = false
   const close = () => {
-    try {
-      chrome.kill()
-    } catch {}
+    if (closed) return
+    closed = true
+    killTree(chrome.pid)
     server.close()
     try {
       fs.rmSync(profileDir, { recursive: true, force: true })

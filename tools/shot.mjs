@@ -33,6 +33,7 @@ try {
   // for the builders to walk to their sites.
   await cdp.eval(`(async () => {
     const { settings, rig, hud } = window.botsBay || window.botCrossing
+    ${args.preset ? `settings.applyPreset(${JSON.stringify(args.preset)})` : ''}
     settings.set('autoQuality', false)
     settings.set('clockTime', false)
     settings.set('autoTime', false)

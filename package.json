@@ -38,6 +38,7 @@
     "assets": "node tools/build-assets.mjs",
     "profile": "node tools/profile.mjs",
     "shot": "node tools/shot.mjs",
+    "smoke": "node tools/smoke.mjs",
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {

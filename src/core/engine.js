@@ -205,8 +205,8 @@ export class Engine {
         this.tiltShift.setAngle(s.get('tiltShiftAngle'))
         this.tiltShift.setCamera(this.camera)
       }
-      // Exactly one of the two finishes the frame.
-      if (this.outputPass) this.outputPass.enabled = !(this.tiltShift && this.tiltShift.enabled)
+      // Exactly one pass finishes the frame, and which one depends on what follows it.
+      this._syncOutputPass()
     }
 
     this.resize()
@@ -254,17 +254,36 @@ export class Engine {
     this.tiltShift.setCamera(this.camera)
     this.tiltShift.setFocusDistance(this._focusDistance)
 
-    // OutputPass applies tone mapping + sRGB once, at the end of the chain — unless the
-    // tilt-shift is running, whose composite already did both on its way out. Two passes
-    // over every pixel of the frame is what that saves; see `applySettings`.
+    // OutputPass applies tone mapping + sRGB once, at the end of the chain. It is switched
+    // off only when the tilt-shift's own composite has already done both, which it does
+    // exactly when it is the last pass — see `_syncOutputPass`.
     this.outputPass = new OutputPass()
-    this.outputPass.enabled = !this.settings.get('tiltShift')
     composer.addPass(this.outputPass)
 
     this.smaaPass = new SMAAPass(1, 1)
     composer.addPass(this.smaaPass)
 
     this.composer = composer
+    this._syncOutputPass()
+  }
+
+  /**
+   * Decide which pass finishes the frame.
+   *
+   * The tilt-shift's composite tone maps and encodes on its way out, saving a second pass
+   * over every pixel — but three only compiles a material to tone map when that material
+   * draws to the *screen*, so the composite can only do this while it is the last pass in
+   * the chain. Antialiasing puts SMAA after it, and then the composite draws into a render
+   * target, leaves the frame in linear HDR, and the output pass has to do the job instead.
+   *
+   * Getting this wrong is not subtle: the composite named a tone-mapping function three had
+   * not emitted, its fragment shader failed to compile, and the pass drew nothing — a black
+   * canvas on the two presets that turn antialiasing on, and only those two.
+   */
+  _syncOutputPass() {
+    if (!this.outputPass) return
+    const tiltFinishes = Boolean(this.tiltShift?.enabled) && !this.smaaPass?.enabled
+    this.outputPass.enabled = !tiltFinishes
   }
 
   _disposeComposer() {

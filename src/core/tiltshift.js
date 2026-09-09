@@ -161,8 +161,27 @@ const BLUR_FRAG = /* glsl */ `
   }
 `
 
-// Three prepends its tone-mapping and colour-space functions to every fragment shader, so
-// the ones used below are already declared; including the chunks again redefines them.
+/**
+ * The composite. It puts the sharp frame and the soft one back together, and then finishes
+ * the frame — tone mapping and the sRGB transfer — using **three's own two chunks** rather
+ * than a hand-written copy of them.
+ *
+ * That is not a style preference, it is the whole correctness of this pass. Three decides
+ * per compile whether a material tone maps at all: it does when the material draws to the
+ * screen, and it does not when the material draws into a render target
+ * (`WebGLPrograms.getParameters`). Only in the first case does it emit the tone-mapping
+ * functions into the shader at all. A shader that names `ACESFilmicToneMapping` behind its
+ * own `#define` therefore compiles in the first case and fails to compile in the second —
+ * and a pass whose fragment shader will not compile draws nothing, which is a black frame.
+ *
+ * This pass is in the second case whenever anything follows it in the chain, which is what
+ * antialiasing does. `<tonemapping_fragment>` expands to nothing when three compiled this
+ * without tone mapping, and `linearToOutputTexel` is generated for whichever colour space
+ * is actually being written — the sRGB transfer for the screen, the identity for a linear
+ * target. So the output is finished when this is the last pass and left in linear HDR when
+ * it is not, which is exactly what the pass after it expects. `engine.js` keeps the output
+ * pass switched on for that second case.
+ */
 const COMPOSITE_FRAG = /* glsl */ `
   uniform sampler2D tSharp;
   uniform sampler2D tBlur;
@@ -178,23 +197,8 @@ const COMPOSITE_FRAG = /* glsl */ `
     float t = smoothstep( ${BLEND_FROM.toFixed(2)}, ${BLEND_TO.toFixed(2)}, radius );
     gl_FragColor = vec4( mix( sharp, soft.rgb, t ), 1.0 );
 
-    #ifdef LINEAR_TONE_MAPPING
-      gl_FragColor.rgb = LinearToneMapping( gl_FragColor.rgb );
-    #elif defined( REINHARD_TONE_MAPPING )
-      gl_FragColor.rgb = ReinhardToneMapping( gl_FragColor.rgb );
-    #elif defined( CINEON_TONE_MAPPING )
-      gl_FragColor.rgb = CineonToneMapping( gl_FragColor.rgb );
-    #elif defined( ACES_FILMIC_TONE_MAPPING )
-      gl_FragColor.rgb = ACESFilmicToneMapping( gl_FragColor.rgb );
-    #elif defined( AGX_TONE_MAPPING )
-      gl_FragColor.rgb = AgXToneMapping( gl_FragColor.rgb );
-    #elif defined( NEUTRAL_TONE_MAPPING )
-      gl_FragColor.rgb = NeutralToneMapping( gl_FragColor.rgb );
-    #endif
-
-    #ifdef SRGB_TRANSFER
-      gl_FragColor = sRGBTransferOETF( gl_FragColor );
-    #endif
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
   }
 `
 
@@ -216,7 +220,7 @@ const halfTarget = () =>
 class TiltShiftPass extends Pass {
   constructor() {
     super()
-    this.name = 'tilt-shift (+ output)'
+    this.name = 'tilt-shift'
     this.needsSwap = true
 
     this._rtA = halfTarget()
@@ -269,8 +273,6 @@ class TiltShiftPass extends Pass {
       depthTest: false,
       depthWrite: false,
     })
-    this._toneMapping = null
-    this._outputColorSpace = null
 
     this._quad = new FullScreenQuad(null)
   }
@@ -290,28 +292,6 @@ class TiltShiftPass extends Pass {
     this._blurV.uniforms.uTexel.value.set(1 / w, 1 / h)
   }
 
-  /**
-   * Tone mapping and colour space follow the renderer, the way three's own OutputPass
-   * does it, so a change of tone mapper in the settings reaches this pass too. Only rebuilt
-   * when one of them actually changes — a define is a recompile.
-   */
-  _syncOutput(renderer) {
-    if (this._toneMapping === renderer.toneMapping && this._outputColorSpace === renderer.outputColorSpace) return
-    this._toneMapping = renderer.toneMapping
-    this._outputColorSpace = renderer.outputColorSpace
-    const defines = {}
-    const tm = renderer.toneMapping
-    if (tm === THREE.LinearToneMapping) defines.LINEAR_TONE_MAPPING = ''
-    else if (tm === THREE.ReinhardToneMapping) defines.REINHARD_TONE_MAPPING = ''
-    else if (tm === THREE.CineonToneMapping) defines.CINEON_TONE_MAPPING = ''
-    else if (tm === THREE.ACESFilmicToneMapping) defines.ACES_FILMIC_TONE_MAPPING = ''
-    else if (tm === THREE.AgXToneMapping) defines.AGX_TONE_MAPPING = ''
-    else if (tm === THREE.NeutralToneMapping) defines.NEUTRAL_TONE_MAPPING = ''
-    if (renderer.outputColorSpace === THREE.SRGBColorSpace) defines.SRGB_TRANSFER = ''
-    this._composite.defines = defines
-    this._composite.needsUpdate = true
-  }
-
   render(renderer, writeBuffer, readBuffer) {
     // Sideways, into the first half-size target. This is the half that reads depth.
     this._blurH.uniforms.tDiffuse.value = readBuffer.texture
@@ -325,8 +305,9 @@ class TiltShiftPass extends Pass {
     this._quad.material = this._blurV
     this._quad.render(renderer)
 
-    // Back together at full size, finished if this is the last pass.
-    this._syncOutput(renderer)
+    // Back together at full size. Whether this also finishes the frame — tone mapping and
+    // the sRGB transfer — is decided by three from the target being written, which is what
+    // `COMPOSITE_FRAG` is written around.
     this._composite.uniforms.tSharp.value = readBuffer.texture
     this._composite.uniforms.tBlur.value = this._rtB.texture
     renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer)
