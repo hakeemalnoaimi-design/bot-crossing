@@ -12,6 +12,7 @@ import path from 'node:path'
 import http from 'node:http'
 
 import { mergeState } from '../src/game/merge-state.js'
+import { partitionDormant } from '../src/game/hidden-projects.js'
 
 // ── the three-way merge ───────────────────────────────────────────────────────
 
@@ -177,4 +178,47 @@ test('viewedAt is carried through the v1 migration with the ids it keys on', asy
     const state = await (await call('/api/state')).json()
     assert.deepEqual(Object.keys(state.viewedAt), [`claude-code:${id}`])
   })
+})
+
+// ── dormancy ──────────────────────────────────────────────────────────────────
+
+/**
+ * `hideDormant` used to ask whether a *whole zone* was quiet, which is the right question for
+ * a checkout with four threads and the wrong one for a zone of 184 workflows where 143 are
+ * switched off. The line is now drawn per thread.
+ */
+const sleeper = (id, project) => ({ id, project, dormant: true })
+const awake = (id, project) => ({ id, project, dormant: false })
+const isDormant = (t) => t.dormant
+
+test('a zone keeps only what is awake in it, rather than all or nothing', () => {
+  const { shown, folded } = partitionDormant(
+    [awake('a', 'Internal'), sleeper('b', 'Internal'), sleeper('c', 'Internal')],
+    isDormant
+  )
+  assert.deepEqual(shown.map((t) => t.id), ['a'], 'the sleepers are left off')
+  assert.equal(folded.size, 0, 'the zone itself stays — something in it is awake')
+})
+
+test('a zone with nothing awake in it folds away and is offered back', () => {
+  const { shown, folded } = partitionDormant(
+    [awake('a', 'Live'), sleeper('b', 'Quiet'), sleeper('c', 'Quiet')],
+    isDormant
+  )
+  assert.deepEqual(shown.map((t) => t.id), ['a'])
+  assert.deepEqual([...folded], ['Quiet'], 'folded names zones, not threads')
+})
+
+test('an entirely dormant colony is drawn in full rather than emptied', () => {
+  // A bare planet reads as broken rather than tidy, and nothing on screen says which it was.
+  const all = [sleeper('a', 'One'), sleeper('b', 'Two')]
+  const { shown, folded } = partitionDormant(all, isDormant)
+  assert.equal(shown.length, 2, 'nothing is hidden when everything is quiet')
+  assert.equal(folded.size, 0)
+})
+
+test('threads with no project are grouped under one name, not lost', () => {
+  const { shown, folded } = partitionDormant([awake('a', ''), sleeper('b', '')], isDormant)
+  assert.deepEqual(shown.map((t) => t.id), ['a'])
+  assert.equal(folded.size, 0, 'the unnamed zone still has something awake in it')
 })

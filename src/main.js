@@ -14,6 +14,7 @@ import {
   fetchState,
   saveState,
   openThread,
+  retryThread,
   newSession,
   revealFolder,
 } from './game/api.js'
@@ -233,6 +234,26 @@ const actions = {
       setTimeout(poll, 1800)
     } catch (err) {
       hud.toast(err.message || 'Could not open that thread', 'err')
+    }
+  },
+
+  /**
+   * Ask the harness to run this thread again.
+   *
+   * The only action here that changes anything outside this machine, and the only one a thread
+   * has to opt into: the button is drawn from `canRetry`, which the adapter sets, so nothing on
+   * this side knows what is retryable or what running again even means. A poll is queued
+   * afterwards because the answer — a new run, in a new state — is on the next scan.
+   */
+  retryThread: async () => {
+    const thread = threads.find((t) => t.id === selectedId)
+    if (!thread || !thread.canRetry) return
+    try {
+      const done = await retryThread(thread)
+      hud.toast(done.message || 'Retrying')
+      setTimeout(poll, 1800)
+    } catch (err) {
+      hud.toast(err.message || 'Could not retry that', 'err')
     }
   },
 
@@ -545,6 +566,10 @@ window.addEventListener('keydown', (e) => {
     case 'A':
       if (selectedId) actions.archiveThread()
       break
+    case 'r':
+    case 'R':
+      if (selectedId) actions.retryThread()
+      break
     case 'v':
     case 'V':
       if (selectedId) actions.markViewed()
@@ -737,6 +762,10 @@ settings.onChange((changed, scope) => {
   if (changed.has('showFps')) hud.syncSettings()
   // Folding dormant repos away changes which threads are on the map, so the colony has to be
   // rebuilt from the list rather than merely re-rendered.
+  // A new world can mean a new zone palette, so the plots have to be rebuilt rather than
+  // merely re-lit — and waiting for the next poll to do it would leave the old colours up
+  // for as long as fifteen seconds.
+  if (changed.has('planet')) applyThreads(threads)
   if (changed.has('hideDormant')) applyThreads(threads)
   if (changed.has('maxAgents')) applyThreads(threads)
 })

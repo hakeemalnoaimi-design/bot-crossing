@@ -1,14 +1,15 @@
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { openTarget } from './lib/opener.mjs'
 import { openInTerminal, schemeHasHandler, schemeOf } from './lib/xdg.mjs'
 import {
   defaultHarness,
   harnessStatus,
   newSession as harnessNewSession,
   openThread as harnessOpenThread,
+  retryThread as harnessRetryThread,
   scanThreads,
 } from './scan.mjs'
 
@@ -126,42 +127,6 @@ async function writeState(next) {
 }
 
 /**
-/**
- * Hand a `harness://…` deep link, or a folder, to whatever opens things on this OS. The
- * opener gets an argument list, never a shell string.
- *
- * Only `present()` calls this, and no harness knowledge ever reaches it: an adapter says what it
- * wants opened and this decides how, which is the seam that keeps `server/harnesses/` swappable.
- *
- * macOS's `open(1)` does both jobs, and `xdg-open` is the Linux equivalent. On Windows the
- * equivalent is ShellExecute, reached through `rundll32 url.dll,FileProtocolHandler`: a
- * registered protocol URL goes to its app and a folder opens in Explorer, with the argument
- * passed through untouched. Two more obvious routes were tried and rejected — `explorer.exe
- * <url>` silently drops any URL that carries a query string, so `code/new?folder=…` never
- * arrived, and `cmd /c start` parses its own argument line, where the `%3A%5C` escapes in that
- * same link are exactly what it expands.
- *
- * The spawn is guarded because the opener may simply not be installed — a headless Linux box
- * has no `xdg-open` — and an unhandled `error` event on a child process takes the whole server
- * down. Failing quietly is right here: there is nothing the page could do with the error, and
- * the scan path must never depend on whether presentation worked.
- */
-const OPENERS = {
-  darwin: ['open'],
-  win32: ['rundll32', 'url.dll,FileProtocolHandler'],
-  linux: ['xdg-open'],
-}
-
-function launch(target) {
-  const opener = OPENERS[process.platform]
-  if (!opener) return
-  const [cmd, ...args] = opener
-  const child = spawn(cmd, [...args, target], { stdio: 'ignore', detached: true })
-  child.on('error', () => {})
-  child.unref()
-}
-
-/**
  * A folder is openable only if it is still on this machine and still a directory. Paths
  * arrive from the page, which got them from a scan that may be minutes old — a repo that
  * has since been moved or deleted must fail here rather than hand the opener a dead path.
@@ -196,12 +161,12 @@ async function present(result) {
 
   if (process.platform !== 'linux') {
     if (!result.url) return { ok: false, error: 'That harness has no deep link to open on this platform' }
-    launch(result.url)
+    await openTarget(result.url)
     return { ok: true, url: result.url }
   }
 
   if (result.url && (await schemeHasHandler(result.url))) {
-    launch(result.url)
+    await openTarget(result.url)
     return { ok: true, url: result.url }
   }
   if (result.command) {
@@ -411,13 +376,27 @@ export async function apiMiddleware(req, res, next) {
       return send(res, shown.ok ? 200 : 400, shown)
     }
 
+    /**
+     * Run something again in the harness it came from — the one endpoint here that changes
+     * anything outside this machine.
+     *
+     * It is behind the same Origin check as every other write, and the adapter is what decides
+     * whether the thing being asked for is legitimate: nothing here knows what a retryable
+     * thread looks like, and the `ref` travels through untouched, as it does everywhere else.
+     */
+    if (url.pathname === '/api/retry' && req.method === 'POST') {
+      const { harness, ref } = await readJsonBody(req)
+      const done = await harnessRetryThread(harness, ref)
+      return send(res, done.ok ? 200 : 400, done)
+    }
+
     if ((url.pathname === '/api/new-session' || url.pathname === '/api/reveal') && req.method === 'POST') {
       const { folder, harness } = await readJsonBody(req)
       const dir = await resolveFolder(folder)
       if (!dir) return send(res, 400, { ok: false, error: 'That folder is not on this machine any more' })
 
       if (url.pathname === '/api/reveal') {
-        launch(dir)
+        await openTarget(dir)
         return send(res, 200, { ok: true })
       }
       const shown = await present(await harnessNewSession(harness || (await defaultHarness()), dir))

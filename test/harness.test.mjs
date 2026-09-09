@@ -239,5 +239,14 @@ test('Cursor offers a folder link but never a per-thread one it cannot honour', 
   assert.equal(schemeOf(opened.url), 'cursor')
   assert.ok(opened.url.includes('%20'), 'a space in the path is escaped, not left raw')
   assert.equal(h.newSession('relative/path').ok, false)
+
+  // A Windows path is absolute without a leading slash, and testing for one refused every
+  // folder on that platform. The drive letter keeps its colon; the URL keeps its root slash.
+  if (process.platform === 'win32') {
+    const win = h.newSession('C:\\Users\\me\\some repo')
+    assert.equal(win.ok, true, 'a Windows folder is somewhere Cursor can open')
+    assert.equal(win.url, 'cursor://file/C:/Users/me/some%20repo')
+    assert.equal(h.newSession('Users\\me').ok, false, 'still relative, still refused')
+  }
   await fsp.rm(home, { recursive: true, force: true })
 })

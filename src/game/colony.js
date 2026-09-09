@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { PLANETS, createTerrain, createScatter, terrainHeight } from '../world/planet.js'
+import { PLANETS, createTerrain, createScatter, terrainHeight, waterUniforms } from '../world/planet.js'
 import { Sky } from '../world/sky.js'
 import {
   Plot,
@@ -19,7 +19,7 @@ import { Indicators, BADGE } from '../agents/indicators.js'
 import { MAX_AGENT_CAP } from '../core/settings.js'
 import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
-import { liveThreadsForColony } from './hidden-projects.js'
+import { liveThreadsForColony, partitionDormant } from './hidden-projects.js'
 
 /**
  * The colony: everything that turns a list of agent threads into a place.
@@ -243,6 +243,11 @@ export class Colony {
     this.planet = planet
     this.sky.setPlanet(planet)
     this._buildTerrain()
+    // A world can bring its own zone palette, so every plot's colour is now potentially from
+    // the wrong one. Clearing the signatures makes the next sync rebuild them through the
+    // path that already knows how to take a plot apart, rather than a second teardown here.
+    for (const plot of this.plots.values()) plot.signature = ''
+    this.usedAccents.clear()
   }
 
   onSettingsChanged(changed, scope) {
@@ -267,36 +272,37 @@ export class Colony {
     const now = Date.now()
     const live = liveThreadsForColony(threads, archivedIds, hiddenProjects)
 
-    // Group by repo, biggest project first so the busiest work lands nearest the middle.
-    const byProject = new Map()
-    for (const thread of live) {
-      const key = thread.project || 'unknown'
-      if (!byProject.has(key)) byProject.set(key, [])
-      byProject.get(key).push(thread)
-    }
     /**
-     * Repos where nothing has stirred in days, folded away on request.
+     * Anything that has not stirred in days, left off the map on request.
      *
      * A colony is a map you learn, and a map is only learnable if what is on it is worth
      * looking at. Someone with a hundred checkouts has most of the ground given over to work
      * they finished in the spring, and the six repos they are actually living in are somewhere
-     * in among it. Dormant is already a status the colony understands — nothing for three days
-     * — so this is that same line drawn one level up, at the repo rather than the thread.
+     * in among it. Dormant is already a status the colony understands — nothing for three
+     * days — so this is that same line, drawn before anything is placed.
      *
-     * Deliberately all-or-nothing per repo: a zone with one live thread in it stays whole,
-     * because half a zone would misrepresent the repo rather than tidy the map.
+     * This used to be all-or-nothing per repo: a zone kept every one of its threads unless
+     * *all* of them were dormant, on the grounds that half a zone misrepresents the repo. That
+     * reasoning holds for a checkout with four threads. It falls apart at the scale a workflow
+     * harness brings — one zone of 184 n8n workflows, 143 of them switched off for months and
+     * a handful live, kept all 184 buildings on the map because the rule only ever asked
+     * whether the *whole* zone was quiet. The dead ones were most of what was being drawn.
+     *
+     * So the line is drawn per thread, and a zone that ends up with nothing left has folded
+     * away — which is the same outcome the old rule produced, reached one level down.
      */
-    const dormant = new Set()
-    if (this.settings.get('hideDormant')) {
-      for (const [name, list] of byProject) {
-        if (list.every((t) => statusFor(t, now) === 'sleeping')) dormant.add(name)
-      }
-      // Never fold away everything: a colony that answers a poll with an empty planet reads as
-      // broken rather than tidy, and there is nothing on screen to tell you which it was.
-      if (dormant.size === byProject.size) dormant.clear()
-      for (const name of dormant) byProject.delete(name)
+    const { shown, folded } = this.settings.get('hideDormant')
+      ? partitionDormant(live, (t) => statusFor(t, now) === 'sleeping')
+      : { shown: live, folded: new Set() }
+    this.dormantProjects = folded
+
+    // Group by repo, biggest project first so the busiest work lands nearest the middle.
+    const byProject = new Map()
+    for (const thread of shown) {
+      const key = thread.project || 'unknown'
+      if (!byProject.has(key)) byProject.set(key, [])
+      byProject.get(key).push(thread)
     }
-    this.dormantProjects = dormant
 
     const projects = [...byProject.entries()].sort((a, b) => {
       if (b[1].length !== a[1].length) return b[1].length - a[1].length
@@ -309,7 +315,7 @@ export class Colony {
     // reclaims the same ground if it is still free. Re-inserting the entry also keeps
     // LAYOUT_MEMORY from evicting a name you only hid — otherwise a zone folded away for a
     // week loses where it used to be, and comes back somewhere else entirely.
-    for (const name of [...hiddenProjects, ...dormant]) {
+    for (const name of [...hiddenProjects, ...folded]) {
       const cells = this.plotCells.get(name)
       if (!cells) continue
       this.plotCells.delete(name)
@@ -455,17 +461,28 @@ export class Colony {
     return terrainHeight(x, z, this.planet)
   }
 
-  /** A stable colour per repo, probing forward on a collision so no two plots match. */
+  /**
+   * A stable colour per repo, probing forward on a collision so no two plots match.
+   *
+   * The world chooses the palette: Bahrain's zones are pearl white, and any world without an
+   * opinion gets the default. Hashing the *name* is what keeps a repo the same colour across
+   * reloads, and it keeps its place in the palette when the palette itself changes.
+   */
+  _palette() {
+    return this.planet.palette ?? PLOT_PALETTE
+  }
+
   _pickAccent(name) {
-    const start = hashString(name) % PLOT_PALETTE.length
-    for (let i = 0; i < PLOT_PALETTE.length; i++) {
-      const accent = PLOT_PALETTE[(start + i) % PLOT_PALETTE.length]
+    const palette = this._palette()
+    const start = hashString(name) % palette.length
+    for (let i = 0; i < palette.length; i++) {
+      const accent = palette[(start + i) % palette.length]
       if (!this.usedAccents.has(accent)) {
         this.usedAccents.add(accent)
         return accent
       }
     }
-    return PLOT_PALETTE[start]
+    return palette[start]
   }
 
   _syncBuilding(thread, plot, index) {
@@ -474,7 +491,10 @@ export class Colony {
     const target = 1
 
     if (!entry) {
-      const mesh = createBuilding({ seed: hashString(thread.id), accent: plot.accent })
+      // A structure normally wears its zone's colour; the world's own default accent is the
+      // fallback for one that has no zone to take a colour from.
+      const accent = plot.accent ?? this.planet.accent
+      const mesh = createBuilding({ seed: hashString(thread.id), accent })
       const pos = plot.worldSlot(index)
       mesh.position.copy(pos)
       mesh.rotation.y = ((hashString(thread.id) >>> 8) % 360) * (Math.PI / 180)
@@ -712,6 +732,8 @@ export class Colony {
 
     const night = this.sky.nightFactor ?? 0
     buildingUniforms.uNight.value = night
+    // The sea darkens on the same signal, in the terrain material rather than the buffer.
+    waterUniforms.uNight.value = night
     // One write turns every rotor in the colony.
     buildingUniforms.uTime.value = elapsed
     this.ship.update(dt, elapsed, night)

@@ -88,6 +88,9 @@ export async function saveState(state) {
  */
 export const openThread = (thread) => post('/api/open', { harness: thread.harness, ref: thread.ref })
 
+/** Ask the harness to run this thread again. Only offered where `canRetry` is set. */
+export const retryThread = (thread) => post('/api/retry', { harness: thread.harness, ref: thread.ref })
+
 /** A brand new thread in a repo, via that harness's own new-session deep link. */
 export const newSession = (folder, harness) => post('/api/new-session', { folder, harness })
 

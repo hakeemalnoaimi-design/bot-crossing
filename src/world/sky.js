@@ -57,15 +57,6 @@ const SKY_FRAG = /* glsl */ `
 `
 
 /** Named times of day. The slider is continuous; these are just the good stops. */
-/**
- * This machine's wall clock as a day fraction — 0 is midnight, 0.5 is noon, which is exactly
- * what `timeOfDay` means. Local time on purpose: the point is that the colony's light matches
- * the light out of your own window, so UTC would be the wrong answer nearly everywhere.
- */
-export function systemTimeOfDay(now = new Date()) {
-  return (now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400
-}
-
 export const TIMES = [
   { id: 'dawn', label: 'Dawn', value: 0.255 },
   { id: 'morning', label: 'Morning', value: 0.34 },
@@ -74,6 +65,99 @@ export const TIMES = [
   { id: 'dusk', label: 'Dusk', value: 0.755 },
   { id: 'night', label: 'Night', value: 0.94 },
 ]
+
+/**
+ * The clock the colony runs on. Not the machine's: BotsBay is in Bahrain, the agents on this
+ * map are working Bahrain hours, and a laptop opened in another timezone should still show
+ * the light the office is actually standing in.
+ *
+ * `Intl.DateTimeFormat` is what does the conversion, offsets and all — deriving it by hand
+ * from `getTimezoneOffset` gets Gulf Standard Time right and every timezone with a summer
+ * clock wrong, and the browser already ships the whole database.
+ */
+export const WORLD_TIMEZONE = 'Asia/Bahrain'
+
+const zoneClock = new Intl.DateTimeFormat('en-GB', {
+  timeZone: WORLD_TIMEZONE,
+  hour12: false,
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+})
+
+/**
+ * Wall clock in Bahrain, as minutes since midnight. `hourCycle` is left alone and `hour12`
+ * turned off, which gives 00–23 in `en-GB`; the 24 that some locales return for midnight is
+ * folded back to 0 rather than being trusted to be 0 already.
+ */
+function zoneMinuteOfDay(now) {
+  const parts = zoneClock.formatToParts(now)
+  const at = (type) => Number(parts.find((p) => p.type === type)?.value ?? 0)
+  return (at('hour') % 24) * 60 + at('minute') + at('second') / 60
+}
+
+/**
+ * Where the named times of day actually fall in Bahrain, as `[wall clock, timeOfDay]`.
+ *
+ * A straight `seconds / 86400` would be defensible on a planet and is wrong on a real one:
+ * it puts the sun down at 22:30, so the world is still bright through the evening and the
+ * lights come on around bedtime. Anchoring the four times that matter and interpolating
+ * between them keeps the middle of the day linear while pinning sunset where the Gulf
+ * actually has it.
+ *
+ * The gap from night back round to dawn carries the whole night, and is why the table wraps
+ * rather than clamping — the interpolation crosses midnight in both columns at once.
+ *
+ * Both this table and the function below work in whole minutes since midnight rather than in
+ * fractions of a day, so that an anchor is a value the search lands on exactly. Through a
+ * fraction it is not: `1065 / 1440 * 1440` is `1064.9999999999998`, and 17:45 then misses
+ * dusk by 4e-16 — the same answer to fifteen decimal places, and a boundary that reads as
+ * broken to anyone who tests the spec it was written from.
+ */
+const DAY_MINUTES = 24 * 60
+const CLOCK_ANCHORS = [
+  [5 * 60 + 30, 0.255], // 05:30 — dawn
+  [12 * 60, 0.5], // 12:00 — noon
+  [17 * 60 + 45, 0.755], // 17:45 — dusk
+  [19 * 60 + 30, 0.94], // 19:30 — night
+]
+
+/**
+ * Piecewise-linear through `CLOCK_ANCHORS`, wrapping through midnight.
+ * Minutes since midnight in, `timeOfDay` 0..1 out.
+ */
+export function timeOfDayForMinute(minuteOfDay) {
+  const day = ((minuteOfDay % DAY_MINUTES) + DAY_MINUTES) % DAY_MINUTES
+  // Before the first anchor is the tail of the previous night, which the wrapped final
+  // segment covers — so it is looked up a day later rather than clamped to dawn.
+  const minute = day < CLOCK_ANCHORS[0][0] ? day + DAY_MINUTES : day
+  for (let i = 0; i < CLOCK_ANCHORS.length; i++) {
+    const [fromClock, fromValue] = CLOCK_ANCHORS[i]
+    const last = i === CLOCK_ANCHORS.length - 1
+    // The final segment runs to the first anchor of the next day, so both columns advance
+    // by a whole turn rather than folding back on themselves.
+    const [nextClock, nextValue] = last ? CLOCK_ANCHORS[0] : CLOCK_ANCHORS[i + 1]
+    const toClock = last ? nextClock + DAY_MINUTES : nextClock
+    const toValue = last ? nextValue + 1 : nextValue
+    if (minute < fromClock || minute > toClock) continue
+    const t = (minute - fromClock) / (toClock - fromClock)
+    // Exact on the anchors themselves. `from + 1 * (to - from)` is not `to` in floating
+    // point, and these four instants are the specification rather than a curve through it —
+    // 05:30 has to *be* dawn, not dawn plus 5e-17.
+    if (t === 0) return fromValue % 1
+    if (t === 1) return toValue % 1
+    return (fromValue + t * (toValue - fromValue)) % 1
+  }
+  return CLOCK_ANCHORS[0][1]
+}
+
+/**
+ * Bahrain's wall clock as a `timeOfDay` — 0 is midnight, 0.5 is noon, which is what the
+ * sky's own `time` means.
+ */
+export function systemTimeOfDay(now = new Date()) {
+  return timeOfDayForMinute(zoneMinuteOfDay(now))
+}
 
 const SUN_AXIS = 0.72 // which way the sun tracks across the sky
 /**
@@ -96,6 +180,9 @@ const SHADOW_EXTENT = 30
  */
 const SHADOW_SNAP = 2
 
+/** How often the sky re-reads the wall clock while following it. */
+const CLOCK_INTERVAL_MS = 60_000
+
 export class Sky {
   constructor(scene, settings, renderer) {
     this.scene = scene
@@ -106,6 +193,8 @@ export class Sky {
     scene.add(this.group)
 
     this.sunDir = new THREE.Vector3(0, 1, 0)
+    /** When the wall clock was last read. Zero means "on the next frame". */
+    this._clockAt = 0
     this.dayFactor = 1
     this._c1 = new THREE.Color()
     this._c2 = new THREE.Color()
@@ -344,10 +433,19 @@ export class Sky {
     this.dayTop = new THREE.Color(planet.sky.top)
     this.dayBottom = new THREE.Color(planet.sky.bottom)
     // Night is the day palette crushed toward the planet's own horizon colour, so each
-    // world keeps its identity after dark instead of all three going the same black.
-    this.nightTop = new THREE.Color(planet.sky.top).multiplyScalar(0.16).lerp(new THREE.Color(0x03040c), 0.7)
-    this.nightBottom = new THREE.Color(planet.horizon).multiplyScalar(0.5)
-    this.duskColor = new THREE.Color(planet.atmosphere > 0.4 ? 0xd4692f : 0x4a3550)
+    // world keeps its identity after dark instead of all of them going the same black.
+    // A world may also spell its night out — `night` on the preset wins where it exists,
+    // which is how Bahrain gets an indigo sky over a deep Gulf blue waterline rather than
+    // a dimmer copy of its own noon.
+    this.nightTop = planet.night
+      ? new THREE.Color(planet.night.top)
+      : new THREE.Color(planet.sky.top).multiplyScalar(0.16).lerp(new THREE.Color(0x03040c), 0.7)
+    this.nightBottom = planet.night
+      ? new THREE.Color(planet.night.horizon)
+      : new THREE.Color(planet.horizon).multiplyScalar(0.5)
+    // What a low sun bleeds into. The atmosphere rule is the fallback; a world with an
+    // opinion about its own sunsets states it.
+    this.duskColor = new THREE.Color(planet.dusk ?? (planet.atmosphere > 0.4 ? 0xd4692f : 0x4a3550))
 
     const comp = planet.companion
     this.companionBody.material.color.set(comp.color)
@@ -460,6 +558,9 @@ export class Sky {
         this.sun.shadow.map = null
       }
     }
+    // Re-enabling the clock jumps to it now rather than whenever the minute happens to
+    // be up, which would otherwise leave the sky wherever the scrubber was dropped.
+    if (changed.has('clockTime')) this._clockAt = 0
     if (changed.has('stars')) this.setTime(this.time)
     if (changed.has('ibl') || changed.has('iblIntensity')) {
       this.scene.environmentIntensity = this.settings.get('iblIntensity')
@@ -477,10 +578,17 @@ export class Sky {
     this._refreshEnvironment()
 
     // Following the clock beats cycling: both drive the same value, and a cycle running on
-    // top of it would just fight. Re-read every frame rather than on a timer — it is two
-    // divisions, and it means crossing midnight or the machine waking from sleep needs no
-    // special case.
+    // top of it would just fight.
+    //
+    // Once a minute, not once a frame. A minute of Bahrain moves the light by well under
+    // what anyone can see between two frames, and the read is a timezone conversion rather
+    // than the two divisions it used to be. The gate is on the wall clock rather than an
+    // accumulated dt, so a machine coming back from sleep re-reads on its first frame
+    // instead of an hour late — which also covers crossing midnight for free.
     if (this.settings.get('clockTime')) {
+      const now = Date.now()
+      if (now - this._clockAt < CLOCK_INTERVAL_MS) return false
+      this._clockAt = now
       const t = systemTimeOfDay()
       if (Math.abs(t - this.time) < 1e-5) return false
       this.setTime(t)

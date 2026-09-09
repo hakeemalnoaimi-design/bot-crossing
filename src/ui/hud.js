@@ -1,6 +1,6 @@
 import { PRESETS, PLANETS_ORDER } from './hud-data.js'
 import { PLANETS } from '../world/planet.js'
-import { TIMES, systemTimeOfDay } from '../world/sky.js'
+import { TIMES, systemTimeOfDay, WORLD_TIMEZONE } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
@@ -36,6 +36,7 @@ const ICON = {
   camera: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M3 8.5h3.2l1.5-2h8.6l1.5 2H21v11H3z"/><circle cx="12" cy="14" r="3.4"/></svg>`,
   help: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.5 2.5 0 1 1 3.4 2.3c-.7.3-1 .8-1 1.6v.4"/><path d="M12 17h.01"/></svg>`,
   open: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M20 4l-8.5 8.5"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>`,
+  retry: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-.6 4"/><path d="M20 5v6h-6"/></svg>`,
   archive: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18v3H3z"/><path d="M5 9v10h14V9"/><path d="M10 13h4"/></svg>`,
   close: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
   back: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 5.5 8 12l6.5 6.5"/></svg>`,
@@ -211,6 +212,11 @@ export class Hud {
         },
         this.controls
       ),
+      this._toggle(
+        'Follow local clock',
+        'clockTime',
+        `The sky runs on Bahrain time (${WORLD_TIMEZONE}), wherever you are opening this from. Pressing L or dragging the scrubber turns it off; this is how it comes back.`
+      ),
       this._slider('Time of day', 'timeOfDay', 0, 1, 0.005, clockLabel, undefined, () => {
         // Reaching for the slider is a request for a particular light, so stop following the
         // clock — otherwise the next frame would drag the thumb straight back.
@@ -237,9 +243,9 @@ export class Hud {
     const view = group('View')
     view.append(
       this._toggle(
-        'Hide dormant repos',
+        'Hide dormant threads',
         'hideDormant',
-        'Takes a repo off the map when every thread in it has been quiet for three days. Its threads are untouched, and it comes back to the same ground the moment one wakes up.'
+        'Leaves anything quiet for three days off the map, and folds a zone away entirely when nothing in it is awake. Nothing is touched in the harness, and it all comes back to the same ground the moment something stirs.'
       )
     )
     view.append(
@@ -361,6 +367,7 @@ export class Hud {
     on('#btn-time', 'click', () => this.actions.cycleTime?.())
     on('#btn-open', 'click', () => this.actions.openThread?.())
     on('#btn-viewed', 'click', () => this.actions.markViewed?.())
+    on('#btn-retry', 'click', () => this.actions.retryThread?.())
     on('#btn-archive', 'click', () => this.actions.archiveThread?.())
     on('#btn-deselect', 'click', () => this.actions.select?.(null))
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
@@ -436,7 +443,10 @@ export class Hud {
     const hiddenWrap = this.$('.hidden-projects')
     hiddenWrap.innerHTML = ''
     for (const p of hidden) {
-      const accent = PLOT_PALETTE[hashString(p.name) % PLOT_PALETTE.length]
+      // Same palette the colony is drawing with, or a hidden repo shows a swatch in a
+      // colour that world does not use.
+      const palette = PLANETS[this.settings.get('planet')]?.palette ?? PLOT_PALETTE
+      const accent = palette[hashString(p.name) % palette.length]
       const row = document.createElement('div')
       row.className = 'repo hidden-repo'
       row.innerHTML =
@@ -609,6 +619,10 @@ export class Hud {
     // crowd the two that are always worth having, and "Viewed" on a thread that is not asking
     // for anything is a control with no effect.
     this.$('#btn-viewed').hidden = !thread.unread
+    // Same rule as Viewed, and for the same reason: a control that cannot do anything is
+    // worse than no control. Which threads can be re-run is the harness's business — the page
+    // only reads the flag.
+    this.$('#btn-retry').hidden = !thread.canRetry
   }
 
   /**
@@ -978,6 +992,7 @@ const TEMPLATE = `
   <div class="pair">
     <button class="btn primary" id="btn-open" title="Open this thread in the harness it came from (Enter)">${ICON.open} Open</button>
     <button class="btn" id="btn-viewed" title="Stop this thread asking for you until it moves on again (V)">${ICON.eye} Viewed</button>
+    <button class="btn" id="btn-retry" title="Run this again in the harness it came from (R)">${ICON.retry} Retry</button>
     <button class="btn" id="btn-archive" title="Archive — this astronaut walks back to the ship (A)">${ICON.archive} Archive</button>
   </div>
 </div>
@@ -1009,6 +1024,7 @@ const TEMPLATE = `
         <div class="k"><span>Archive</span><kbd>A</kbd></div>
         <div class="k"><span>New conversation</span><kbd>C</kbd></div>
         <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
+        <div class="k"><span>Retry a failed run</span><kbd>R</kbd></div>
         <div class="k"><span>Change planet</span><kbd>Tab</kbd></div>
         <div class="k"><span>Time of day</span><kbd>L</kbd></div>
         <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>

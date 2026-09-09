@@ -32,6 +32,34 @@ export function liveThreadsForColony(threads, archivedIds, hiddenProjects) {
 }
 
 /**
+ * Split the map into what is drawn and which zones that emptied out.
+ *
+ * `isDormant` is handed in rather than imported, because the rule for it lives with the rest
+ * of the thread→behaviour mapping and this module has no business knowing it — and because it
+ * is what makes this testable without dragging a renderer in behind it.
+ *
+ * Two guarantees the caller depends on:
+ *
+ *   - **Nothing is ever emptied entirely.** A colony that answers a poll with a bare planet
+ *     reads as broken rather than tidy, and there is nothing on screen to say which it was. If
+ *     every last thread is dormant, none of them are hidden.
+ *   - **`folded` is zones, not threads.** It is what the HUD offers back as a list, so it
+ *     names only the zones that left the map completely.
+ */
+export function partitionDormant(live, isDormant) {
+  const awake = live.filter((t) => !isDormant(t))
+  if (!awake.length) return { shown: live, folded: new Set() }
+
+  const kept = new Set(awake.map((t) => t.project || 'unknown'))
+  const folded = new Set()
+  for (const t of live) {
+    const zone = t.project || 'unknown'
+    if (!kept.has(zone)) folded.add(zone)
+  }
+  return { shown: awake, folded }
+}
+
+/**
  * What the sidebar lists, with a live count each — so a hidden repo that has since gone quiet
  * reads as `0` and you can tell it is safe to forget rather than having to show it to find out.
  */

@@ -216,11 +216,22 @@ function openThread() {
   }
 }
 
-/** `cursor://file/<abs>` is answered by the installed app; the OS opener does the finding. */
+/**
+ * `cursor://file/<abs>` is answered by the installed app; the OS opener does the finding.
+ *
+ * Absolute is judged by `path.isAbsolute`, not a leading `/`: no Windows path has one, so
+ * testing for it refused every folder on this machine and the button never worked here. The
+ * separators are still normalised to `/` for the URL, and a drive letter keeps the leading
+ * slash the path form drops — `C:\repo` is `cursor://file/C:/repo`. The colon is left alone
+ * rather than percent-encoded, since it is part of the path rather than something in it.
+ */
 function newSession(dir) {
-  const abs = String(dir || '').replace(/\\/g, '/')
-  if (!abs.startsWith('/')) return { ok: false, error: 'That folder is not somewhere Cursor can open' }
-  return { ok: true, url: `cursor://file${abs.split('/').map(encodeURIComponent).join('/')}` }
+  if (typeof dir !== 'string' || !path.isAbsolute(dir)) {
+    return { ok: false, error: 'That folder is not somewhere Cursor can open' }
+  }
+  const abs = dir.replace(/\\/g, '/')
+  const encoded = abs.split('/').map((part) => (/^[A-Za-z]:$/.test(part) ? part : encodeURIComponent(part))).join('/')
+  return { ok: true, url: `cursor://file${encoded.startsWith('/') ? '' : '/'}${encoded}` }
 }
 
 const detect = () => exists(PROJECTS)

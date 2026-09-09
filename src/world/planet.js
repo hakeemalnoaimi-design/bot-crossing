@@ -2,14 +2,85 @@ import * as THREE from 'three'
 import { atlasTexture, hasPart, part } from './kit.js'
 
 /**
- * The three worlds you can put the colony on, and the terrain generator that draws them.
+ * The worlds you can put the colony on, and the terrain generator that draws them.
  *
  * A planet is nothing but a bag of colours and a couple of switches — terrain, scatter, sky
- * and lighting all read from the same preset, so adding a fourth world is a data change
- * rather than a code change.
+ * and lighting all read from the same preset, so adding a world is a data change rather than
+ * a code change.
+ *
+ * These fields are optional, and exist because Bahrain wanted things the first three worlds
+ * did not. Every one falls back to what those worlds already did, so none of them changed:
+ *
+ *   `sea`          — turns the far field into water and the middle into an island
+ *   `night`        — the after-dark sky, instead of the day palette crushed toward black
+ *   `dusk`         — what a low sun bleeds into, instead of the atmosphere rule
+ *   `foliage`      — a tint over the scatter pack's own green, for a drier kind of tree
+ *   `scatterScale` — how planted this world is, under whatever the quality preset asked for
+ *   `palette`      — the zone colours, instead of `PLOT_PALETTE`
+ *   `accent`       — the default building accent, for a structure with no zone colour
  */
 
+/** Night falling, for the water. Written once a frame beside `buildingUniforms.uNight`. */
+export const waterUniforms = { uNight: { value: 0 } }
+
 export const PLANETS = {
+  /**
+   * Home. Sand, shallow turquoise water and a haze that never quite clears — and the one
+   * world here that is a real place, which is why it is the default rather than the Moon.
+   */
+  bahrain: {
+    id: 'bahrain',
+    name: 'Bahrain',
+    blurb: 'Pale sand, turquoise shallows, and a Gulf haze.',
+    ground: { low: 0xc7a972, high: 0xe8d5a8, tint: 0xf5e9cc },
+    rock: 0xb09b78,
+    horizon: 0x2bb5ae,
+    sky: { top: 0x3d7fbe, bottom: 0xe6d4ab },
+    // Indigo overhead, deep Gulf blue at the waterline — not the day palette dimmed.
+    night: { top: 0x151b3e, horizon: 0x0b1f3a },
+    dusk: 0xe8763a,
+    fog: { color: 0xd6c39c, near: 88, far: 245 },
+    sun: { color: 0xfff2d8, intensity: 2.5, night: 0.11 },
+    ambient: { sky: 0x9fcfe0, ground: 0x8a7448, intensity: 0.95 },
+    atmosphere: 1,
+    craters: 0,
+    // Low, because dunes are dunes and not hills. The island shaping below does the shape.
+    roughness: 0.5,
+    scatter: 'palms',
+    // Sparse on purpose: a palm every few metres is a plantation, not a Gulf island.
+    scatterScale: 0.4,
+    foliage: 0xd2dc9e,
+    accent: 0xf2ede3,
+    /**
+     * Zone colours, re-rooted on pearl white. Overrides `PLOT_PALETTE` for this world only.
+     *
+     * Pearl is a narrow band to pick twelve distinguishable colours out of, so these spread
+     * across *value* as well as hue — pearl down through champagne and greige to oyster —
+     * rather than being twelve tints of the same lightness, which would be a dozen zones
+     * nobody could tell apart. Measured, the closest pair here is ΔE 9.0; the closest pair
+     * in `PLOT_PALETTE` is ΔE 1.0, so this is the more separable of the two.
+     */
+    palette: [
+      0xf2ede3, 0xe6d9bc, 0xd4e2df, 0xf0dbd0, 0xdcd6c6, 0xdde4f2,
+      0xf3e9cc, 0xd7e2d2, 0xecd8e0, 0xc6d2d6, 0xe6e0f0, 0xd8cbb4,
+    ],
+    sea: {
+      /**
+       * Below every dune, not at zero. The hollows between the dunes reach about -3 at this
+       * roughness, and a waterline at zero puts the sea *above* them — sand sitting in a
+       * basin with the water standing over it, which reads as a hole in the world rather
+       * than as an island. Dropping the sea instead of raising the land leaves the colony
+       * floor where every other system expects it, and the island gains a coastal bank.
+       */
+      level: -3.6,
+      shore: 100,
+      falloff: 34,
+      shallow: 0x2bb5ae,
+      deep: 0x0b1f3a,
+    },
+    companion: { name: 'Moon', color: 0xdcd8cc, size: 3.2, glow: 0xfff6e0 },
+    dust: 0.5,
+  },
   moon: {
     id: 'moon',
     name: 'Luna',
@@ -93,6 +164,12 @@ export function createTerrain(planet, detail, seed = 1337) {
   const tint = new THREE.Color(planet.ground.tint)
   const c = new THREE.Color()
 
+  // Only a world with a sea pays for any of this; the other three allocate nothing.
+  const water = planet.sea ? new Float32Array(pos.count) : null
+  const shallow = planet.sea ? new THREE.Color(planet.sea.shallow) : null
+  const deep = planet.sea ? new THREE.Color(planet.sea.deep) : null
+  const sea = new THREE.Color()
+
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i)
     const z = pos.getZ(i)
@@ -114,7 +191,14 @@ export function createTerrain(planet, detail, seed = 1337) {
       else y += (1 - Math.abs(t - 1.22) / 0.28) * crater.depth * 0.32
     }
 
+    // Past the shore the dunes settle to the waterline, which is what turns the plane into
+    // an island rather than ground that happens to stop. Same call the height sampler makes,
+    // so anything walking or building on this surface agrees with what is drawn.
+    const wet = seaMix(dist, planet)
+    if (wet > 0) y = THREE.MathUtils.lerp(y, planet.sea.level, wet)
+
     pos.setY(i, y)
+    if (water) water[i] = wet
 
     // Colour: height-driven blend, mottled with a second noise band so it never bands.
     const shade = THREE.MathUtils.clamp(0.42 + y * 0.09 + fbm(noise, x * 0.09, z * 0.09, 2) * 0.5, 0, 1)
@@ -124,12 +208,22 @@ export function createTerrain(planet, detail, seed = 1337) {
     // Darken the far field hard so the eye settles on the colony and the hills read as a
     // silhouette rather than as more ground competing with the plots for attention.
     c.multiplyScalar(1 - THREE.MathUtils.smoothstep(dist, COLONY_RADIUS * 0.7, GROUND_SIZE * 0.35) * 0.75)
+
+    // Water is laid over that darkening rather than under it: a sea crushed to near-black
+    // by the far-field falloff is just more silhouette, and the turquoise is the point.
+    // Fog is what takes it to the horizon instead.
+    if (wet > 0) {
+      const depth = THREE.MathUtils.smoothstep(dist, planet.sea.shore, planet.sea.shore + planet.sea.falloff * 2.6)
+      c.lerp(sea.copy(shallow).lerp(deep, depth * 0.72), wet)
+    }
+
     colors[i * 3] = c.r
     colors[i * 3 + 1] = c.g
     colors[i * 3 + 2] = c.b
   }
 
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  if (water) geo.setAttribute('aWater', new THREE.BufferAttribute(water, 1))
   geo.computeVertexNormals()
 
   const mat = new THREE.MeshStandardMaterial({
@@ -140,6 +234,7 @@ export function createTerrain(planet, detail, seed = 1337) {
     // is what sells "dust" rather than "plastic".
     envMapIntensity: 0.3,
   })
+  if (planet.sea) makeWet(mat, planet.sea)
   const mesh = new THREE.Mesh(geo, mat)
   mesh.receiveShadow = true
   mesh.name = 'terrain'
@@ -147,6 +242,56 @@ export function createTerrain(planet, detail, seed = 1337) {
   // Sampler so anything placed later can sit exactly on the surface.
   mesh.userData.heightAt = (x, z) => sampleHeight(x, z, noise, craters, planet)
   return mesh
+}
+
+/**
+ * How much of the surface at `dist` from the middle is water: 0 on the island, 1 out at sea,
+ * with the beach in between. Worlds without a `sea` are dry everywhere.
+ */
+function seaMix(dist, planet) {
+  if (!planet.sea) return 0
+  return THREE.MathUtils.smoothstep(dist, planet.sea.shore, planet.sea.shore + planet.sea.falloff)
+}
+
+/**
+ * Sea that darkens after sunset, without rebuilding a 190×190 vertex buffer to do it.
+ *
+ * The water colour is baked into the vertex buffer with everything else, so night has to
+ * happen in the shader: `aWater` says which vertices are sea, `uNight` says how dark it is
+ * outside, and the fragment stage mixes between them. Sand is untouched because `aWater` is
+ * zero there — the whole terrain stays one mesh, one material, one draw.
+ *
+ * Water is also flat and horizontal, which means it faces almost none of a low sun. Left at
+ * the ground's own roughness it goes matte grey at dusk; a smoother, slightly metallic
+ * surface takes its colour from the sky instead, which is what a shallow lagoon does.
+ */
+function makeWet(material, sea) {
+  const deep = new THREE.Color(sea.deep)
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uNight = waterUniforms.uNight
+    shader.uniforms.uDeep = { value: deep }
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n attribute float aWater;\n varying float vWater;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n vWater = aWater;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\n varying float vWater;\n uniform float uNight;\n uniform vec3 uDeep;')
+      .replace(
+        '#include <color_fragment>',
+        '#include <color_fragment>\n diffuseColor.rgb = mix( diffuseColor.rgb, uDeep, vWater * uNight );'
+      )
+      // `roughnessFactor` and `metalnessFactor` are declared by these two chunks, so the
+      // water's own values have to be applied after them rather than up at the colour.
+      .replace(
+        '#include <roughnessmap_fragment>',
+        '#include <roughnessmap_fragment>\n roughnessFactor = mix( roughnessFactor, 0.22, vWater );'
+      )
+      .replace(
+        '#include <metalnessmap_fragment>',
+        '#include <metalnessmap_fragment>\n metalnessFactor = mix( metalnessFactor, 0.35, vWater );'
+      )
+  }
+  // Two materials that compile to different programs must not share a cache key.
+  material.customProgramCacheKey = () => 'terrain-sea'
 }
 
 function sampleHeight(x, z, noise, craters, planet) {
@@ -162,7 +307,8 @@ function sampleHeight(x, z, noise, craters, planet) {
     if (t < 1) y -= (1 - t * t) * crater.depth
     else y += (1 - Math.abs(t - 1.22) / 0.28) * crater.depth * 0.32
   }
-  return y
+  const wet = seaMix(dist, planet)
+  return wet > 0 ? THREE.MathUtils.lerp(y, planet.sea.level, wet) : y
 }
 
 /** Craters only ever land outside the colony, so they never eat a build plot. */
@@ -211,6 +357,20 @@ const SCATTER = {
     { part: 'Grass_2_D_Color1', weight: 4, size: [0.6, 1.3], sink: 0.05, upright: true },
     { part: 'Rock_1_D_Color1', weight: 2, size: [0.4, 0.9], sink: 0.3, tint: true },
   ],
+  /**
+   * Bahrain: Terra's trees and bushes and nothing else — no grass tufts, no scattered
+   * boulders. A palm is taller and thinner than the pack's firs, so the size ranges run
+   * higher than Terra's while the planting stays sparse, which is the `scatterScale` on
+   * the preset rather than a change here.
+   */
+  palms: [
+    { part: 'Tree_1_A_Color1', weight: 4, size: [0.5, 0.85], sink: 0.02, upright: true },
+    { part: 'Tree_3_A_Color1', weight: 3, size: [0.5, 0.85], sink: 0.02, upright: true },
+    { part: 'Tree_4_A_Color1', weight: 2, size: [0.45, 0.8], sink: 0.02, upright: true },
+    { part: 'Tree_1_C_Color1', weight: 1, size: [0.35, 0.6], sink: 0.02, upright: true },
+    { part: 'Bush_1_E_Color1', weight: 3, size: [0.4, 0.9], sink: 0.08, upright: true },
+    { part: 'Bush_3_B_Color1', weight: 2, size: [0.4, 0.9], sink: 0.08, upright: true },
+  ],
   rocks: [
     { part: 'Rock_1_D_Color1', weight: 4, size: [0.5, 1.2], sink: 0.3, tint: true },
     { part: 'Rock_2_C_Color1', weight: 4, size: [0.5, 1.2], sink: 0.3, tint: true },
@@ -238,11 +398,15 @@ function fallbackShapes(isFlora) {
 export function createScatter(planet, density, keepClear = [], seed = 4242) {
   const group = new THREE.Group()
   group.name = 'scatter'
-  const count = Math.round(SCATTER_BUDGET * THREE.MathUtils.clamp(density, 0, 1))
+  // `scatterScale` is the world's own idea of how planted it is, under whatever the quality
+  // preset asked for — so turning quality up on a sparse world gets you a better-looking
+  // sparse world rather than a lush one.
+  const planted = THREE.MathUtils.clamp(density, 0, 1) * (planet.scatterScale ?? 1)
+  const count = Math.round(SCATTER_BUDGET * planted)
   if (count <= 0) return group
 
   const rand = mulberry(seed)
-  const isFlora = planet.scatter === 'flora'
+  const isFlora = planet.scatter === 'flora' || planet.scatter === 'palms'
   const recipe = SCATTER[planet.scatter] || SCATTER.rocks
   const ready = recipe.every((r) => hasPart(r.part, 'forest'))
 
@@ -268,6 +432,10 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
   )
 
   const rock = new THREE.Color(planet.rock)
+  // What foliage is tinted with. White leaves the pack's own green alone, which is what
+  // Terra wants; Bahrain hands over a pale olive that multiplies the green down to the
+  // drier, dustier palm colour without darkening it the way a saturated tint would.
+  const leaf = new THREE.Color(planet.foliage ?? 0xffffff)
   const dummy = new THREE.Object3D()
   const color = new THREE.Color()
   const fill = new Array(kinds.length).fill(0)
@@ -290,6 +458,9 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
     const x = Math.cos(a) * d
     const z = Math.sin(a) * d
     if (keepClear.some((p) => Math.hypot(x - p.x, z - p.z) < p.r)) continue
+    // Nothing grows in the sea, and the beach itself stays clear — a palm standing in the
+    // surf is the one thing that would give the island away as a painted plane.
+    if (seaMix(d, planet) > 0.02) continue
 
     const which = pickKind()
     const kind = kinds[which]
@@ -319,7 +490,7 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
     // because it *multiplies* the atlas rather than replacing it — the pack's stone is a
     // mid grey, and rust times mid grey is a much darker rust than the ground it sits on.
     if (kind.tint) color.copy(rock).multiplyScalar(1.55)
-    else color.setRGB(1, 1, 1)
+    else color.copy(leaf)
     color.offsetHSL((rand() - 0.5) * 0.03, (rand() - 0.5) * 0.08, (rand() - 0.5) * 0.14)
     mesh.setColorAt(slot, color)
     fill[which] = slot + 1

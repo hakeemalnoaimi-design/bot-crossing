@@ -127,18 +127,33 @@ const DEFAULTS = {
   ...PRESETS.balanced.values,
 
   // World
-  planet: 'moon',
+  planet: 'bahrain',
   /**
-   * Fold away repos where every thread has been quiet for three days. On by default: with
-   * several harnesses read at once the map otherwise fills with every checkout you have ever
-   * opened, and the few repos actually being worked in get lost among them. It is reversible in
-   * one click and a folded repo returns to the same ground the moment a thread wakes up.
+   * Whether this browser has already been moved onto the BotsBay defaults — see `migrate`.
+   * True here so a fresh install is born migrated and never has the rule applied to a choice
+   * it made itself.
+   */
+  worldMigrated: true,
+  /**
+   * Leave anything quiet for three days off the map, folding a zone away when nothing in it
+   * is awake. On by default: with several harnesses read at once the map otherwise fills with
+   * every checkout you have ever opened and every workflow anyone ever switched off, and the
+   * few things actually being worked on get lost among them. It is reversible in one click,
+   * and everything returns to the same ground the moment it stirs.
    */
   hideDormant: true,
   timeOfDay: 0.32, // 0..1 — 0 is midnight, 0.5 is noon
   autoTime: false,
-  /** Sky follows this machine's own clock. Wins over `autoTime`; both off is manual. */
-  clockTime: false,
+  /**
+   * Sky follows the wall clock in Bahrain — see `WORLD_TIMEZONE` in `world/sky.js`. Wins over
+   * `autoTime`; both off is manual.
+   *
+   * On by default, because the light matching the office the agents are working in is the
+   * whole point of the map being a place rather than a chart. Reaching for `L` or the
+   * scrubber turns it off, on the grounds that asking for a particular light is asking for
+   * that light to stay put; the Settings toggle is how it comes back.
+   */
+  clockTime: true,
   dayLength: 240, // seconds for a full cycle when autoTime is on
 
   // Look
@@ -266,10 +281,34 @@ export class Settings {
   }
 }
 
+/**
+ * Move a browser that has been here before onto the new world, once.
+ *
+ * Stored settings beat defaults, which is right — but it means changing a default reaches
+ * nobody who has ever opened the page, and "Bahrain is the default" would have been true
+ * only on a machine that had never run this. So the two keys the fork changed are moved
+ * across, and only where they still hold the value the *old* default put there: a browser
+ * sitting on Luna with the clock off is one that never chose either, and anything else is a
+ * real choice and is left alone. `worldMigrated` makes it a one-time thing, so cycling back
+ * to Luna afterwards sticks.
+ */
+const MIGRATIONS = [{ key: 'planet', was: 'moon', now: 'bahrain' }, { key: 'clockTime', was: false, now: true }]
+
+function migrate(raw) {
+  if (raw.worldMigrated) return raw
+  for (const { key, was, now } of MIGRATIONS) {
+    if (raw[key] === was) raw[key] = now
+  }
+  raw.worldMigrated = true
+  return raw
+}
+
 function load() {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORE_KEY) || '{}')
-    return raw && typeof raw === 'object' ? raw : {}
+    const stored = localStorage.getItem(STORE_KEY)
+    if (!stored) return {}
+    const raw = JSON.parse(stored)
+    return raw && typeof raw === 'object' ? migrate(raw) : {}
   } catch {
     return {}
   }

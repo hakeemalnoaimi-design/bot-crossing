@@ -17,10 +17,35 @@ import { mulberry } from './planet.js'
  * repo lands where you are already looking and quiet ones ring the edge.
  */
 
+/** The default zone colours. A world may bring its own — see `palette` on a planet preset. */
 export const PLOT_PALETTE = [
   0xc96442, 0x4f9a63, 0x4f7ec9, 0xb8942a, 0x8b5cc9, 0xc94f8b,
   0x3fa8a0, 0xc97f4f, 0x6f8f4f, 0x5c7fc9, 0xc95c5c, 0x7f6fc9,
 ]
+
+/**
+ * How light a deck is allowed to get. Every colour in `PLOT_PALETTE` already lands under
+ * this — the highest is 0.334 — so for those the cap never fires and the deck is exactly
+ * what it always was.
+ *
+ * It exists for a pale palette. The deck is derived by desaturating the zone's accent, which
+ * quietly assumed an accent of middling lightness: hand it pearl white and the plate comes
+ * out at 0.75, a near-white slab that the buildings standing on it disappear into. The cap
+ * is on lightness rather than on the palette because the next pale world would hit it too.
+ */
+const DECK_MAX_LIGHTNESS = 0.34
+const _deckHsl = {}
+
+/**
+ * Dark and nearly desaturated: the deck is a backdrop for buildings, and the accent belongs
+ * on the border where it can outline the zone without shouting.
+ */
+export function deckColor(accent) {
+  const color = new THREE.Color(accent).offsetHSL(0, -0.38, 0).multiplyScalar(0.9)
+  color.getHSL(_deckHsl)
+  if (_deckHsl.l > DECK_MAX_LIGHTNESS) color.setHSL(_deckHsl.h, _deckHsl.s, DECK_MAX_LIGHTNESS)
+  return color
+}
 
 /** Hex size, centre to corner. Cells tile exactly at this radius. */
 const CELL = 7.6
@@ -474,15 +499,11 @@ export class Plot {
     const geo = BufferGeometryUtils.mergeGeometries(parts)
     parts.forEach((g) => g.dispose())
 
-    // Dark and nearly desaturated: the deck is a backdrop for buildings, and the accent
-    // belongs on the border where it can outline the zone without shouting. The plate
-    // pattern arrives as a texture and this tints it, which is why the drawing is authored
-    // neutral grey.
-    // Dark, but not black. The deck is a backdrop and wants to sit under the buildings
-    // rather than compete with them — but its rim faces sideways, so whatever the top reads
-    // as in full sun the edge reads as one stop darker, and a backdrop that goes to nothing
-    // at the plot boundary just looks like a hole.
-    const color = new THREE.Color(this.accent).offsetHSL(0, -0.38, 0).multiplyScalar(0.9)
+    // The plate pattern arrives as a texture and this tints it, which is why the drawing is
+    // authored neutral grey. Dark, but never black: the deck's rim faces sideways, so
+    // whatever the top reads as in full sun the edge reads as one stop darker, and a
+    // backdrop that goes to nothing at the plot boundary just looks like a hole.
+    const color = deckColor(this.accent)
     const plate = deckSurface()
     this.deck = new THREE.Mesh(
       geo,

@@ -171,6 +171,9 @@ export class Engine {
 
   _ensureComposer() {
     if (this.composer) return
+    // Everything below is built at 1x1 and sized by the resize that follows, so the size
+    // cache has to forget what it last applied or that resize will decide it has nothing to do.
+    this._sizedAt = null
     // A depth texture on the target is what lets tilt-shift be a real depth of field rather
     // than a screen-space smear. It costs one attachment, where asking three's own BokehPass
     // for the same thing costs a second pass over the entire scene.
@@ -228,6 +231,21 @@ export class Engine {
     this.tiltShift = null
   }
 
+  /**
+   * Size the drawing buffer to the element.
+   *
+   * The scale is *not* re-derived from the setting here, and that is the whole point. The
+   * governor scales **under** whatever was chosen, and it owns `viewport.scale` between
+   * resizes; reasserting the ceiling would hand the buffer back at full size every time
+   * anything called this — a window resize, a DPR change, waking from a hidden tab — and
+   * leave the governor to walk it back down a step a second, reallocating the buffer and
+   * every float target in the post chain at each step. That churn is visible: measured, the
+   * buffer never settled, running 951 → 1632 → 1056 → 768 → 672 inside twenty seconds.
+   *
+   * A ceiling that has genuinely moved is different. Raising the quality setting, or
+   * dragging the window to a display with another pixel ratio, is a new instruction rather
+   * than a layout change, so the governor starts again from it.
+   */
   resize() {
     const parent = this.canvas.parentElement
     if (!parent) return
@@ -237,19 +255,54 @@ export class Engine {
     this.camera.aspect = w / h
     this.camera.updateProjectionMatrix()
 
-    const scale = this._targetScale()
-    const bw = Math.max(1, Math.round(w * scale))
-    const bh = Math.max(1, Math.round(h * scale))
+    const ceiling = this._targetScale()
+    const settled = this.viewport?.scale
+    const ceilingMoved = this._ceiling === undefined || Math.abs(this._ceiling - ceiling) > 0.001
+    if (ceilingMoved) this._resetGovernor()
+    this._ceiling = ceiling
+    const scale = settled == null || ceilingMoved ? ceiling : Math.min(settled, ceiling)
 
-    // Only the drawing buffer is sized here. The element's own size is left to the CSS
-    // (`position: absolute; inset: 0`), because a hand-written width is a second opinion
-    // about how big the canvas is — and the moment the two disagree, the scene is drawn to
-    // one rectangle while every panel is positioned against the other.
+    // The element's own size, which the pointer maths reads. Only the drawing buffer is
+    // sized below; the element is left to the CSS (`position: absolute; inset: 0`), because
+    // a hand-written width is a second opinion about how big the canvas is — and the moment
+    // the two disagree, the scene is drawn to one rectangle while every panel is positioned
+    // against the other.
+    this.viewport = { ...this.viewport, w, h }
+    this._applyBufferSize(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)), scale)
+  }
+
+  /**
+   * Resize every target, then put something in them before the compositor can look.
+   *
+   * `setSize` on the renderer and the composer throws away their attachments and allocates
+   * new ones, and a newly allocated target holds nothing. Whether the frame that lands in
+   * between reads as a flash depends on the browser — but there is no reason to leave it to
+   * chance when drawing once here closes the window entirely. It is the same trick `_onWake`
+   * already used for coming back from a hidden tab.
+   */
+  _applyBufferSize(bw, bh, scale) {
+    // Measured against what was last actually applied, not against the viewport: a composer
+    // that has just been rebuilt is 1×1 and needs sizing even when the buffer itself has not
+    // moved a pixel, so `_ensureComposer` clears this to say so.
+    if (this._sizedAt && this._sizedAt.bw === bw && this._sizedAt.bh === bh) {
+      this.viewport = { ...this.viewport, scale }
+      return
+    }
+    this._sizedAt = { bw, bh }
     this.renderer.setSize(bw, bh, false)
     this.composer?.setSize(bw, bh)
     this.tiltShift?.setSize(bw, bh)
     this.tiltShift?.setCamera(this.camera)
-    this.viewport = { w, h, bw, bh, scale }
+    this.viewport = { ...this.viewport, bw, bh, scale }
+    if (this.running) this.renderFrame()
+  }
+
+  /** Forget what the governor has learned — the thing it was scaling against has changed. */
+  _resetGovernor() {
+    this._slow = 0
+    this._fast = 0
+    this._climbAt = 0
+    this.autoScaled = false
   }
 
   /**
@@ -376,11 +429,9 @@ export class Engine {
       if (!parent) return
       const bw = Math.max(1, Math.round(parent.clientWidth * next))
       const bh = Math.max(1, Math.round(parent.clientHeight * next))
-      this.renderer.setSize(bw, bh, false)
-      this.composer?.setSize(bw, bh)
-      this.tiltShift?.setSize(bw, bh)
-    this.tiltShift?.setCamera(this.camera)
-      this.viewport = { ...this.viewport, bw, bh, scale: next }
+      // Through the same path a resize takes, so the new targets are drawn into before the
+      // compositor sees them — and so there is one place that knows how to change size.
+      this._applyBufferSize(bw, bh, next)
       this.autoScaled = next < ceiling - 0.01
     }
   }
