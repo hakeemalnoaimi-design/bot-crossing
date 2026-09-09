@@ -320,35 +320,66 @@ export class Particles {
   }
 
   /**
-   * Planet haze — dust on Mars, pollen on Terra. Spawned in a ring around the camera so it
-   * is always where you are looking without simulating the whole world.
+   * Weather. What drifts through the air on this world — sand low over the ground on
+   * Bahrain, dust on Mars, pollen on Terra — spawned in a ring around the camera so it is
+   * always where you are looking without simulating the whole planet. `planet.weather`
+   * says which, `planet.dust` how much.
+   *
+   * Sand is the one that has to read from the overview: it all moves *with the wind*, the
+   * same way, close to the ground and briskly, which is what makes a still island look
+   * like it has weather rather than a particle system. It settles and skitters rather than
+   * hanging in the air the way dust does.
    */
   ambient(dt, camera, planet) {
-    if (!this.enabled || !planet.dust) return
+    const weather = planet.weather
+    if (!this.enabled || !weather || !planet.dust) return
     this._ambientTimer -= dt
     if (this._ambientTimer > 0) return
-    const rate = this.settings.get('particles') === 'full' ? 0.045 : 0.12
+    const full = this.settings.get('particles') === 'full'
+    const rate = weather === 'sand' ? (full ? 0.03 : 0.075) : full ? 0.045 : 0.12
     this._ambientTimer = rate / planet.dust
 
     const a = Math.random() * Math.PI * 2
     const r = 12 + Math.random() * 34
     const x = camera.position.x + Math.cos(a) * r
     const z = camera.position.z + Math.sin(a) * r
-    const terra = planet.id === 'terra'
+
+    if (weather === 'sand') {
+      const wind = planet.wind || { x: 1, z: 0 }
+      const gust = 1.6 + Math.random() * 2.2
+      this.dust.spawn(
+        x,
+        0.12 + Math.random() * Math.random() * 1.1,
+        z,
+        wind.x * gust + (Math.random() - 0.5) * 0.4,
+        0.05 + Math.random() * 0.25,
+        wind.z * gust + (Math.random() - 0.5) * 0.4,
+        0.94,
+        0.86,
+        0.68,
+        0.05 + Math.random() * 0.09,
+        1.6 + Math.random() * 2.2,
+        0.05, // barely any drag: the wind carries it
+        0.03 // and a slow settle back to the ground
+      )
+      return
+    }
+
+    const pollen = weather === 'pollen'
     this.dust.spawn(
       x,
       0.4 + Math.random() * 5,
       z,
-      terra ? (Math.random() - 0.5) * 0.5 : 1.6 + Math.random() * 1.4,
-      terra ? 0.15 + Math.random() * 0.25 : 0.1,
-      terra ? (Math.random() - 0.5) * 0.5 : 0.7 + Math.random(),
-      terra ? 0.85 : 0.78,
-      terra ? 0.9 : 0.55,
-      terra ? 0.55 : 0.4,
-      terra ? 0.09 : 0.2,
+      pollen ? (Math.random() - 0.5) * 0.5 : 1.6 + Math.random() * 1.4,
+      pollen ? 0.15 + Math.random() * 0.25 : 0.1,
+      pollen ? (Math.random() - 0.5) * 0.5 : 0.7 + Math.random(),
+      pollen ? 0.85 : 0.78,
+      pollen ? 0.9 : 0.55,
+      pollen ? 0.55 : 0.4,
+      pollen ? 0.09 : 0.2,
       3 + Math.random() * 3,
       0.12,
-      terra ? -0.02 : 0.02
+      pollen ? -0.02 : 0.02
     )
   }
 

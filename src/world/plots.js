@@ -474,6 +474,14 @@ export class Plot {
     this.group.position.copy(this.center)
     this.group.name = `plot:${id}`
 
+    /**
+     * The point in the evening this plot's lamps come on, as a night factor (0 day, 1
+     * night). Spread from golden hour to just past sunset, so across the map the lights
+     * come on a plot at a time rather than the whole island at once.
+     */
+    this.lightsAt = 0.28 + (((hashString(id) >>> 3) % 1000) / 1000) * 0.42
+    this._litAt = 0
+
     this._buildDeck()
     this._buildBorder()
     this._buildPosts()
@@ -579,18 +587,44 @@ export class Plot {
     this.group.add(this.border)
   }
 
-  /** A lamp post on one corner of each cell — the plot's own night lighting. */
+  /**
+   * A lamp post on one corner of each cell — the plot's own night lighting — and, under
+   * each, the pool of light it throws on the deck.
+   *
+   * The lamps do not fade up with the dusk; they *come on*. Each plot has a moment in the
+   * evening that is its own (`lightsAt`), and when the sky reaches it the lamps strike one
+   * after another over most of a second, each stuttering like a tube before it holds. That
+   * is the one time of day the whole map visibly does something, and it is what makes dusk
+   * an event rather than a gradient. All of it is one uniform per plot — seconds since the
+   * switch — and a delay per lamp; the pools on the deck share both.
+   */
   _buildPosts() {
+    const rand = mulberry(hashString(this.id) + 41)
     const posts = []
     const lamps = []
+    const pools = []
+    const delayOf = (geo, delay) => {
+      const count = geo.attributes.position.count
+      geo.setAttribute('aDelay', new THREE.BufferAttribute(new Float32Array(count).fill(delay), 1))
+    }
     this.localCenters.forEach(({ x, z }, i) => {
       const [px, pz] = corner(x, z, (i * 2) % 6, TILE * 0.72)
       const pole = new THREE.CylinderGeometry(0.055, 0.085, 1.8, 6)
       pole.translate(px, DECK_TOP + 0.9, pz)
       posts.push(pole)
+
+      const delay = rand() * 0.9
       const head = new THREE.SphereGeometry(0.14, 8, 6)
       head.translate(px, DECK_TOP + 1.84, pz)
+      delayOf(head, delay)
       lamps.push(head)
+
+      // Flat on the deck, a hair above it so it never fights the plate for the pixel.
+      const pool = new THREE.CircleGeometry(1.5, 20)
+      pool.rotateX(-Math.PI / 2)
+      pool.translate(px, DECK_TOP + 0.015, pz)
+      delayOf(pool, delay)
+      pools.push(pool)
     })
 
     const poleMesh = new THREE.Mesh(
@@ -598,12 +632,18 @@ export class Plot {
       new THREE.MeshStandardMaterial({ color: 0x9a9aa2, roughness: 0.7, metalness: 0.3 })
     )
     poleMesh.castShadow = true
-    this.lampMaterial = new THREE.MeshBasicMaterial({ color: this.accent, toneMapped: true })
+
+    /** Seconds since this plot's lamps were switched on, or -1 while they are off. */
+    this.lampUniforms = { uSince: { value: -1 } }
+    this.lampMaterial = lampMaterial(this.accent, this.lampUniforms)
     this.lamps = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(lamps), this.lampMaterial)
-    this._lampBase = new THREE.Color(this.accent)
-    this.group.add(poleMesh, this.lamps)
+    this.poolMaterial = poolMaterial(this.accent, this.lampUniforms)
+    this.pools = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pools), this.poolMaterial)
+    this.pools.renderOrder = 2
+    this.group.add(poleMesh, this.lamps, this.pools)
     posts.forEach((g) => g.dispose())
     lamps.forEach((g) => g.dispose())
+    pools.forEach((g) => g.dispose())
   }
 
   /**
@@ -701,7 +741,13 @@ export class Plot {
       this.borderMaterial.emissiveIntensity =
         0.3 + night * 1.4 + (urgent ? 0.4 + Math.sin(elapsed * 3.4) * 0.32 : 0)
     }
-    this.lampMaterial.color.copy(this._lampBase).multiplyScalar(0.5 + night * 2.4)
+    // The lamps come on at this plot's own moment in the evening, and go off at dawn — a
+    // little later than they came on, so a sky hovering at the line does not flick them.
+    const since = this.lampUniforms.uSince
+    const on = since.value >= 0
+    if (!on && night >= this.lightsAt) this._litAt = elapsed
+    const lit = night >= this.lightsAt || (on && night >= this.lightsAt - 0.08)
+    since.value = lit ? elapsed - this._litAt : -1
   }
 
   dispose() {
@@ -712,6 +758,65 @@ export class Plot {
       }
     })
   }
+}
+
+// ── lamps ─────────────────────────────────────────────────────────────────────────────
+
+/** The strike: dark before its moment, a stutter for most of a second, then steady. */
+const LAMP_STRIKE = /* glsl */ `
+  float lampOn( float t ) {
+    if ( t < 0.0 ) return 0.0;
+    if ( t > 0.8 ) return 1.0;
+    return fract( t * 6.5 ) > 0.42 ? 1.0 : 0.12;
+  }`
+
+/** The lamp head. Dim by day; well past 1.0 when lit, so the bloom pass picks it out. */
+function lampMaterial(accent, uniforms) {
+  const mat = new THREE.MeshBasicMaterial({ color: accent, toneMapped: true })
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uSince = uniforms.uSince
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n attribute float aDelay;\n uniform float uSince;\n varying float vOn;\n ${LAMP_STRIKE}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n vOn = lampOn( uSince - aDelay );`)
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n varying float vOn;`)
+      .replace('#include <color_fragment>', `#include <color_fragment>\n diffuseColor.rgb *= 0.35 + vOn * 2.6;`)
+  }
+  mat.customProgramCacheKey = () => 'plot-lamp'
+  return mat
+}
+
+/**
+ * The pool of light under a lamp: an additive disc on the deck, warmer than the accent,
+ * that comes on with the lamp above it. From the overview this is most of what "the lights
+ * came on" looks like — a lamp head is three pixels, its pool is thirty.
+ */
+function poolMaterial(accent, uniforms) {
+  const warm = new THREE.Color(accent).lerp(new THREE.Color(0xffd9a0), 0.55)
+  const mat = new THREE.MeshBasicMaterial({
+    color: warm,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    toneMapped: true,
+  })
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uSince = uniforms.uSince
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n attribute float aDelay;\n uniform float uSince;\n varying float vOn;\n varying vec2 vPool;\n ${LAMP_STRIKE}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n vOn = lampOn( uSince - aDelay );\n vPool = uv;`)
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n varying float vOn;\n varying vec2 vPool;`)
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+         float edge = length( vPool - 0.5 ) * 2.0;
+         float pool = pow( max( 0.0, 1.0 - edge ), 1.7 );
+         diffuseColor.a *= pool * vOn * 0.4;`
+      )
+  }
+  mat.customProgramCacheKey = () => 'plot-pool'
+  return mat
 }
 
 // ── labels ────────────────────────────────────────────────────────────────────────────

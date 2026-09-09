@@ -127,7 +127,7 @@ async function __profile({ scale = 1, quick = false } = {}) {
   // The build minifies class names, so a pass is recognised by what it carries.
   const passName = (pass) =>
     pass.name ||
-    (pass.scene && pass.camera ? 'render (scene + shadows)' : pass.nMips ? 'bloom' : pass.edgesRT ? 'smaa' : pass._toneMapping !== undefined ? 'output' : pass.constructor.name)
+    (pass.scene && pass.camera ? 'render (scene + shadows)' : pass.nMips ? 'bloom' : pass._edgesRT || pass.edgesRT ? 'smaa' : pass._toneMapping !== undefined ? 'output' : pass.constructor.name)
 
   const passes = {}
   if (ext && engine.composer) {

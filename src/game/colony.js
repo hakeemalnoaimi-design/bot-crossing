@@ -1,6 +1,8 @@
 import * as THREE from 'three'
-import { PLANETS, createTerrain, createScatter, terrainHeight, waterUniforms } from '../world/planet.js'
+import { PLANETS, createTerrain, createScatter, terrainHeight, waterUniforms, windUniforms } from '../world/planet.js'
 import { Sky } from '../world/sky.js'
+import { Gulls } from '../world/gulls.js'
+import { Boats } from '../world/boats.js'
 import {
   Plot,
   allocateCells,
@@ -153,6 +155,11 @@ export class Colony {
     this.labelGroup = new THREE.Group()
     scene.add(this.plotGroup, this.labelGroup)
 
+    // Traffic: things that move on their own errands and carry no information, so the
+    // island is never completely still. Gulls over the shore, boats on the water.
+    this.gulls = new Gulls(scene)
+    this.boats = new Boats(scene)
+
     // Dismissing the HUD has to survive a poll: labels are chrome, and a scan landing while
     // everything is hidden must not quietly put them back on screen.
     this.uiVisible = true
@@ -189,6 +196,8 @@ export class Colony {
     this.ship.group.position.y = terrainHeight(ship.x, ship.z, this.planet)
 
     this._dustTint.set(this.planet.ground.high)
+    this.gulls.setPlanet(this.planet)
+    this.boats.setPlanet(this.planet)
   }
 
   /**
@@ -731,23 +740,39 @@ export class Colony {
     if (cycled) this.settings.values.timeOfDay = this.sky.time
 
     const night = this.sky.nightFactor ?? 0
-    buildingUniforms.uNight.value = night
     // The sea darkens on the same signal, in the terrain material rather than the buffer.
     waterUniforms.uNight.value = night
-    // One write turns every rotor in the colony.
+    // One write turns every rotor in the colony, and one sways every palm.
     buildingUniforms.uTime.value = elapsed
+    windUniforms.uWind.value = elapsed
     this.ship.update(dt, elapsed, night)
 
+    const anim = this.settings.get('reducedMotion') ? 0.35 : 1
     this._growBuildings(dt)
+    this._lightBuildings(night)
     this.astronauts.update(dt, elapsed, this.camera)
     this.astronauts.updateRings(elapsed)
     this.indicators.update(this.astronauts.agents, elapsed, (a) => this._badgeFor(a))
     this._emit(dt, elapsed)
     this.particles.ambient(dt, this.camera, this.planet)
     this.particles.update(dt)
+    this.gulls.update(dt, elapsed, anim)
+    this.boats.update(dt, elapsed, anim)
     this._updatePlots(night, elapsed)
     this._updateScaffolds()
     this._updateLabels(dt)
+  }
+
+  /**
+   * Windows and lamps come on building by building through the evening rather than all
+   * fading up together: each has a moment of its own (`lightsAt`, from its seed), and the
+   * shader takes a per-building `uLit` rather than the shared night factor.
+   */
+  _lightBuildings(night) {
+    for (const entry of this.buildings.values()) {
+      const at = entry.mesh.userData.lightsAt ?? 0.5
+      entry.mesh.userData.uniforms.uLit.value = THREE.MathUtils.smoothstep(night, at - 0.03, at + 0.03)
+    }
   }
 
   _growBuildings(dt) {
@@ -893,6 +918,8 @@ export class Colony {
     this.indicators.dispose()
     this.particles.dispose()
     this.scaffolds.dispose()
+    this.gulls.dispose()
+    this.boats.dispose()
     disposeTree(this.worldGroup)
     disposeTree(this.plotGroup)
     disposeTree(this.labelGroup)

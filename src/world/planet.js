@@ -18,10 +18,15 @@ import { atlasTexture, hasPart, part } from './kit.js'
  *   `scatterScale` — how planted this world is, under whatever the quality preset asked for
  *   `palette`      — the zone colours, instead of `PLOT_PALETTE`
  *   `accent`       — the default building accent, for a structure with no zone colour
+ *   `weather`      — what drifts through the air: `sand`, `dust` or `pollen`; `dust` is how much
+ *   `wind`         — which way the sand goes, as a unit-ish direction on the ground
  */
 
-/** Night falling, for the water. Written once a frame beside `buildingUniforms.uNight`. */
+/** Night falling, for the water. Written once a frame by the colony. */
 export const waterUniforms = { uNight: { value: 0 } }
+
+/** Seconds, for the foliage. One write sways every palm on the island. */
+export const windUniforms = { uWind: { value: 0 } }
 
 export const PLANETS = {
   /**
@@ -73,13 +78,25 @@ export const PLANETS = {
        * floor where every other system expects it, and the island gains a coastal bank.
        */
       level: -3.6,
-      shore: 100,
-      falloff: 34,
+      /**
+       * The beach begins here and the water is open past `shore + falloff`. It used to
+       * begin at 100, which put the sea out of frame from the resting view entirely: the
+       * island read as a desert with palms in it, and nothing on the water could be seen
+       * without zooming right out. From here the shallows show at the top of the overview
+       * and the boats are somewhere a glance can land. The colony stops at 46, so nothing
+       * built is ever near the water.
+       */
+      shore: 74,
+      falloff: 26,
       shallow: 0x2bb5ae,
       deep: 0x0b1f3a,
     },
     companion: { name: 'Moon', color: 0xdcd8cc, size: 3.2, glow: 0xfff6e0 },
-    dust: 0.5,
+    // Sand on the wind, low over the ground. The shamal comes off the Gulf from the
+    // north-west; on this map that is this way.
+    weather: 'sand',
+    wind: { x: 0.82, z: 0.57 },
+    dust: 0.9,
   },
   moon: {
     id: 'moon',
@@ -116,6 +133,7 @@ export const PLANETS = {
     roughness: 1.15,
     scatter: 'rocks',
     companion: { name: 'Phobos', color: 0x9a8878, size: 1.5, glow: 0xb8a494 },
+    weather: 'dust',
     dust: 1,
   },
   terra: {
@@ -134,6 +152,7 @@ export const PLANETS = {
     roughness: 0.75,
     scatter: 'flora',
     companion: { name: 'Moon', color: 0xdcd8cc, size: 3.2, glow: 0xfff6e0 },
+    weather: 'pollen',
     dust: 0.25,
   },
 }
@@ -430,11 +449,37 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
     color: 0xffffff,
     flatShading: !ready,
   })
+  // Foliage bends in the wind — more the further up the plant, as a cantilever does — on
+  // a phase taken from where it stands, so a stand of palms moves as a stand rather than as
+  // one palm copied. Boulders carry `aSway` 0 and hold still. Done in the vertex stage so
+  // it costs nothing on the CPU, and the shadow keeps the resting shape, which at this
+  // amplitude is a few centimetres out and not something anyone sees.
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uWind = windUniforms.uWind
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n attribute float aSway;\n uniform float uWind;`)
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+         #ifdef USE_INSTANCING
+           vec2 where = vec2( instanceMatrix[ 3 ][ 0 ], instanceMatrix[ 3 ][ 2 ] );
+         #else
+           vec2 where = vec2( 0.0 );
+         #endif
+         float reach = max( transformed.y, 0.0 );
+         float gust = sin( uWind * 0.8 + where.x * 0.16 + where.y * 0.21 ) + 0.5 * sin( uWind * 2.1 + where.y * 0.33 );
+         transformed.xz += aSway * gust * reach * reach * vec2( 0.011, 0.007 );`
+      )
+  }
+  material.customProgramCacheKey = () => 'scatter-sway'
 
   const total = kinds.reduce((sum, k) => sum + k.weight, 0)
-  const meshes = kinds.map((k) =>
-    new THREE.InstancedMesh(k.geo, material, Math.ceil((count * k.weight) / total) + 8)
-  )
+  const meshes = kinds.map((k) => {
+    const capacity = Math.ceil((count * k.weight) / total) + 8
+    const mesh = new THREE.InstancedMesh(k.geo, material, capacity)
+    mesh.geometry.setAttribute('aSway', new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1))
+    return mesh
+  })
 
   const rock = new THREE.Color(planet.rock)
   // What foliage is tinted with. White leaves the pack's own green alone, which is what
@@ -490,6 +535,7 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
     )
     dummy.updateMatrix()
     mesh.setMatrixAt(slot, dummy.matrix)
+    mesh.geometry.attributes.aSway.array[slot] = kind.upright ? 1 : 0
 
     // Foliage keeps the colour it was painted; rock takes the planet's. The tint is lifted
     // because it *multiplies* the atlas rather than replacing it — the pack's stone is a
@@ -506,6 +552,7 @@ export function createScatter(planet, density, keepClear = [], seed = 4242) {
     mesh.castShadow = true
     mesh.receiveShadow = true
     mesh.instanceMatrix.needsUpdate = true
+    mesh.geometry.attributes.aSway.needsUpdate = true
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
     group.add(mesh)
   })

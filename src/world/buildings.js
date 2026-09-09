@@ -29,9 +29,12 @@ import { ATLAS, CELL, atlasTexture, cellMask, part } from './kit.js'
  *    even though both arrive as flat colour in a single texture.
  */
 
-/** Shared across every building, so night falling is one uniform write for the whole colony. */
+/**
+ * Shared across every building. Night is deliberately *not* in here any more: each building
+ * lights up at a moment of its own (`uLit`, set per building from `lightsAt`), so the
+ * windows come on one at a time through the evening rather than all fading up together.
+ */
 export const buildingUniforms = {
-  uNight: { value: 0 },
   /** Seconds, for anything that turns. One write drives every rotor in the colony. */
   uTime: { value: 0 },
 }
@@ -322,7 +325,7 @@ function decorate(material, uniforms) {
          uniform float uMaxY;
          uniform float uMinY;
          uniform vec3 uAccent;
-         uniform float uNight;
+         uniform float uLit;
          uniform float uCellAccent[ ${CELL_COUNT} ];
          uniform float uCellRoughness[ ${CELL_COUNT} ];
          uniform float uCellMetalness[ ${CELL_COUNT} ];
@@ -363,9 +366,10 @@ function decorate(material, uniforms) {
         '#include <emissivemap_fragment>',
         `#include <emissivemap_fragment>
          // Lamps and beacons, flagged per vertex when the recipe placed them.
-         totalEmissiveRadiance += diffuseColor.rgb * vEmissive * ( 0.25 + uNight * 2.4 );
-         // Window strips and trim come on after dark, in the repo's own colour.
-         totalEmissiveRadiance += uAccent * uCellAccent[ cell ] * uNight * 1.15;
+         totalEmissiveRadiance += diffuseColor.rgb * vEmissive * ( 0.25 + uLit * 2.4 );
+         // Window strips and trim come on in the evening, in the repo's own colour — at
+         // this building's own moment, see \`lightsAt\`.
+         totalEmissiveRadiance += uAccent * uCellAccent[ cell ] * uLit * 1.15;
          // The construction line: a bright band riding just above the ground it rises from.
          float band = 1.0 - smoothstep( 0.0, 0.22, vLocalY - ground );
          totalEmissiveRadiance += uAccent * band * ( 1.0 - step( 0.999, uProgress ) ) * 1.5;`
@@ -467,7 +471,8 @@ export function createBuilding({ seed = 1, accent = 0xc96442, kind = null } = {}
     uMaxY: { value: height },
     uMinY: { value: geo.boundingBox.min.y },
     uAccent: { value: new THREE.Color(accent) },
-    uNight: buildingUniforms.uNight,
+    /** 0 by day, 1 once this building's lights are on. Written per frame by the colony. */
+    uLit: { value: 0 },
     uTime: buildingUniforms.uTime,
     uCellAccent: { value: ACCENT_MASK },
     uCellRoughness: { value: ROUGHNESS },
@@ -508,6 +513,10 @@ export function createBuilding({ seed = 1, accent = 0xc96442, kind = null } = {}
   mesh.userData.height = height
   mesh.userData.footprint = footprint
   mesh.userData.uniforms = uniforms
+  // When in the evening this building's windows come on, as a night factor: somewhere
+  // between golden hour and just after sunset, decided by the same seed as everything else
+  // about it, so it is the same building that is always first on its plot.
+  mesh.userData.lightsAt = 0.3 + (((seed >>> 4) % 1000) / 1000) * 0.4
   mesh.userData.progress = 1
   mesh.userData.setProgress = (p) => {
     const v = THREE.MathUtils.clamp(p, 0, 1)

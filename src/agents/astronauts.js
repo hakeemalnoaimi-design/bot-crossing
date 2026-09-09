@@ -90,6 +90,26 @@ const ARRIVE_RADIUS = SEPARATION + 0.45
 const PATH_BUDGET = 6
 
 /**
+ * Errands. An idle builder now and then walks over to another idle builder — on another
+ * plot, mostly — and the two stand and talk for a while before it walks home.
+ *
+ * This is the life the map has when nothing is running, and it is confined to the idle
+ * state on purpose: a builder that is working, waiting, stuck, celebrating or asleep is
+ * *saying* something, and an errand would talk over it. Idle says nothing, so it can go
+ * visiting. A dormant builder is never a host either — dormant things stay put.
+ */
+/** Seconds between one builder's errands, least and most. */
+const ERRAND_EVERY = [50, 150]
+/** How long a conversation lasts. */
+const CHAT_FOR = [7, 15]
+/** How far a builder will walk to find company. */
+const ERRAND_RANGE = 36
+/** Share of the idle crew that may be out visiting at once; the rest potter as before. */
+const ERRAND_SHARE = 0.2
+/** How close a visitor stands to its host: a pace, just outside the crowd spacing. */
+const CHAT_DISTANCE = 1.3
+
+/**
  * Where a builder switches between its two bodies, in world units from the camera.
  *
  * At the resting overview a builder stands about twenty pixels tall, and the mannequin is
@@ -619,6 +639,11 @@ export class Astronauts {
       frame: 0,
       wander: new THREE.Vector3(),
       wanderAt: 0,
+      // Errands: the current one, when the next may start, and a beat of its own for the
+      // gestures so a pair never moves in unison.
+      errand: null,
+      errandAt: 25 + Math.random() * 90,
+      talkPhase: 0,
       scale: walksOut ? 0 : 1, // pops up out of the ship, or was already standing there
       alive: true,
       path: null,
@@ -666,6 +691,8 @@ export class Astronauts {
 
   /** Status change → new behaviour, new trim, new eye colour. */
   _applyStatus(agent, status) {
+    // Whatever it was doing on its own account, the thread now has something to say.
+    if (agent.errand) this._endErrand(agent)
     const look = AGENT_LOOK[status] || AGENT_LOOK.idle
     agent.trim.set(look.trim)
     agent.eye.setRGB(look.eye[0], look.eye[1], look.eye[2])
@@ -693,6 +720,7 @@ export class Astronauts {
 
   _sendHome(agent) {
     if (agent.state === 'leaving' || agent.state === 'gone') return
+    if (agent.errand) this._endErrand(agent)
     agent.state = 'leaving'
     agent.stateAge = 0
     agent.loop = null
@@ -721,7 +749,7 @@ export class Astronauts {
       const agent = this.agents[i]
       agent.stateAge += dt
       this._step(agent, dt, elapsed, anim)
-      this._animate(agent, dt, anim)
+      this._animate(agent, dt, anim, elapsed)
       this._face(agent, dt)
 
       if (agent.state === 'gone') {
@@ -741,23 +769,21 @@ export class Astronauts {
    * Falls back to the goal itself when there is no path — an astronaut heading vaguely the
    * right way and sliding along walls beats one standing still because A* gave up.
    */
-  _steerTarget(agent, out) {
+  _steerTarget(agent, out, goal = agent.site) {
     const nav = this.nav
-    if (!nav) return out.copy(agent.site)
+    if (!nav) return out.copy(goal)
 
-    const stale =
-      agent.pathVersion !== nav.version ||
-      agent.pathGoal.distanceToSquared(agent.site) > 0.25
+    const stale = agent.pathVersion !== nav.version || agent.pathGoal.distanceToSquared(goal) > 0.25
     if (stale && this._routeBudget > 0) {
       this._routeBudget--
-      agent.path = nav.findPath(agent.pos.x, agent.pos.z, agent.site.x, agent.site.z)
+      agent.path = nav.findPath(agent.pos.x, agent.pos.z, goal.x, goal.z)
       agent.pathAt = 0
       agent.pathVersion = nav.version
-      agent.pathGoal.copy(agent.site)
+      agent.pathGoal.copy(goal)
     }
 
     const path = agent.path
-    if (!path || !path.length) return out.copy(agent.site)
+    if (!path || !path.length) return out.copy(goal)
 
     // Retire waypoints already reached, and any the agent can already see past.
     while (agent.pathAt < path.length - 1) {
@@ -767,31 +793,37 @@ export class Astronauts {
       if (dx * dx + dz * dz > WAYPOINT_REACHED * WAYPOINT_REACHED) break
       agent.pathAt++
     }
-    if (agent.pathAt >= path.length) return out.copy(agent.site)
+    if (agent.pathAt >= path.length) return out.copy(goal)
     const wp = path[agent.pathAt]
     return out.set(wp.x, 0, wp.z)
+  }
+
+  /** The vector to steer along toward `goal`, routed. Scratch: use it before the next call. */
+  _steerTo(agent, goal) {
+    const steer = this._steerTarget(agent, this._wp, goal)
+    return this._v.set(steer.x - agent.pos.x, 0, steer.z - agent.pos.z)
   }
 
   _step(agent, dt, elapsed, anim) {
     const fromX = agent.pos.x
     const fromZ = agent.pos.z
     agent.blocked = false
-    // Distance is always measured to the real goal; steering follows the route to it.
-    const steer = this._steerTarget(agent, this._wp)
-    const toSite = this._v.set(steer.x - agent.pos.x, 0, steer.z - agent.pos.z)
+    // Distance is always measured to the real goal; steering follows the route to it, and
+    // is only asked for by the states that walk somewhere.
+    const toSite = () => this._steerTo(agent, agent.site)
     const dist = Math.hypot(agent.site.x - agent.pos.x, agent.site.z - agent.pos.z)
 
     switch (agent.state) {
       case 'spawning': {
         agent.scale = Math.min(1, agent.scale + dt * 2.6)
         if (agent.stateAge > 0.9) agent.state = 'walking'
-        this._walk(agent, toSite, dist, dt, 0.55)
+        this._walk(agent, toSite(), dist, dt, 0.55)
         break
       }
 
       case 'walking': {
         agent.scale = Math.min(1, agent.scale + dt * 3)
-        this._walk(agent, toSite, dist, dt, 1)
+        this._walk(agent, toSite(), dist, dt, 1)
         // Close enough — settle into whatever this thread is actually doing. Or close
         // enough to *give up*: a site that something was built on top of between polls can
         // never be reached, and an astronaut shouldering a wall forever is worse than one
@@ -819,8 +851,13 @@ export class Astronauts {
 
       case 'at-site': {
         if (agent.status === 'idle') {
-          // Idlers potter around their plot, and `_drift` owns their velocity outright.
-          this._drift(agent, dt, elapsed)
+          // Idlers potter around their plot, and `_drift` owns their velocity outright —
+          // unless one is off on an errand, or has a visitor.
+          if (agent.errand) this._errand(agent, dt, elapsed)
+          else {
+            this._drift(agent, dt, elapsed)
+            if (elapsed > agent.errandAt) this._startErrand(agent, elapsed)
+          }
         } else if (agent.status === 'working' && agent.anchor) {
           this._workRound(agent, dt, elapsed)
         } else {
@@ -839,7 +876,7 @@ export class Astronauts {
 
       case 'leaving': {
         agent.scale = Math.max(0, agent.scale - (dist < 1.4 ? dt * 2.2 : 0))
-        this._walk(agent, toSite, dist, dt, 1.15)
+        this._walk(agent, toSite(), dist, dt, 1.15)
         // Reaching the ramp retires the agent; so does giving up on ever reaching it, so a
         // blocked path can never leave a ghost walking forever.
         if (agent.scale <= 0.001 || (dist < 0.9 && agent.stateAge > 1.5) || agent.stateAge > 22) {
@@ -1086,6 +1123,135 @@ export class Astronauts {
     this._settle(agent, dt)
   }
 
+  // ── errands ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Decide whether to go visiting, and whom.
+   *
+   * Nearer is likelier but not certain, or a builder would only ever visit its neighbour
+   * and the map would settle into pairs. The host has to be idle and at its post with
+   * nobody already on the way, and the visitor needs somewhere to stand beside it that is
+   * neither inside a wall nor on top of someone else.
+   */
+  _startErrand(agent, elapsed) {
+    agent.errandAt = elapsed + ERRAND_EVERY[0] + Math.random() * (ERRAND_EVERY[1] - ERRAND_EVERY[0])
+
+    let idle = 0
+    let out = 0
+    const candidates = []
+    for (const other of this.agents) {
+      if (other.status !== 'idle' || other.state !== 'at-site' || other.scale < 0.9) continue
+      idle++
+      if (other.errand) {
+        out++
+        continue
+      }
+      if (other === agent) continue
+      const d = Math.hypot(other.pos.x - agent.pos.x, other.pos.z - agent.pos.z)
+      // Too near is the same plot; too far is a hike nobody would watch to the end.
+      if (d < 5 || d > ERRAND_RANGE) continue
+      candidates.push({ other, d })
+    }
+    if (!candidates.length || out >= Math.max(1, Math.floor(idle * ERRAND_SHARE))) return
+
+    candidates.sort((a, b) => a.d - b.d)
+    const host = candidates[Math.min(candidates.length - 1, Math.floor(Math.random() * Math.random() * candidates.length))].other
+    const spot = this._spotBeside(host, agent)
+    if (!spot) return
+
+    agent.errand = { kind: 'visit', with: host, spot, phase: 'going', age: 0, since: elapsed, until: 0 }
+    // The host waits for a while, then gives up and potters on if nobody turns up.
+    host.errand = { kind: 'host', with: agent, spot: null, phase: 'waiting', age: 0, since: elapsed, until: elapsed + 40 }
+    agent.pathVersion = -1
+  }
+
+  /** Somewhere a pace from `host`, on the side `visitor` is coming from, that can be stood on. */
+  _spotBeside(host, visitor) {
+    const toward = Math.atan2(visitor.pos.z - host.pos.z, visitor.pos.x - host.pos.x)
+    for (const turn of [0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]) {
+      const a = toward + turn
+      const x = host.pos.x + Math.cos(a) * CHAT_DISTANCE
+      const z = host.pos.z + Math.sin(a) * CHAT_DISTANCE
+      if (this.nav?.isBlocked(x, z)) continue
+      if (this._crowded(x, z, host)) continue
+      return new THREE.Vector3(x, 0, z)
+    }
+    return null
+  }
+
+  /**
+   * One frame of an errand, for either party.
+   *
+   * Anything that breaks the pair — a status change, one of them leaving, the visitor not
+   * making it — ends it for both, and a visitor that is done simply walks home through the
+   * ordinary `walking` state. The host was home all along.
+   */
+  _errand(agent, dt, elapsed) {
+    const e = agent.errand
+    const partner = e.with
+    const paired = partner.errand && partner.errand.with === agent
+    if (!paired || partner.status !== 'idle' || partner.state === 'gone' || agent.status !== 'idle') {
+      this._endErrand(agent)
+      return
+    }
+    e.age += dt
+
+    if (e.kind === 'host') {
+      agent.vel.set(0, 0, 0)
+      if (e.phase === 'talking') this._faceToward(agent, partner.pos, dt)
+      else if (elapsed > e.until) {
+        this._endErrand(agent)
+        return
+      }
+      this._settle(agent, dt)
+      return
+    }
+
+    if (e.phase === 'going') {
+      const to = this._steerTo(agent, e.spot)
+      const left = Math.hypot(e.spot.x - agent.pos.x, e.spot.z - agent.pos.z)
+      this._walk(agent, to, left, dt, 0.85)
+      const near = Math.hypot(partner.pos.x - agent.pos.x, partner.pos.z - agent.pos.z)
+      const stuck = (agent.blocked && e.age > 6) || e.age > 30
+      if (near < CHAT_DISTANCE + 0.5 || left < 0.6 || stuck) {
+        if (near > CHAT_DISTANCE * 2.2) {
+          this._endErrand(agent) // could not get there; never mind
+          return
+        }
+        const until = elapsed + CHAT_FOR[0] + Math.random() * (CHAT_FOR[1] - CHAT_FOR[0])
+        e.phase = 'talking'
+        e.since = elapsed
+        e.until = until
+        agent.talkPhase = Math.random() * 6.28
+        partner.errand.phase = 'talking'
+        partner.errand.since = elapsed
+        partner.errand.until = until
+        partner.talkPhase = agent.talkPhase + 1.7
+      }
+      return
+    }
+
+    // Talking: stand, face each other, and let the clip and the face do the rest.
+    agent.vel.set(0, 0, 0)
+    this._faceToward(agent, partner.pos, dt)
+    this._settle(agent, dt)
+    if (elapsed > e.until) this._endErrand(agent)
+  }
+
+  _endErrand(agent) {
+    const e = agent.errand
+    if (!e) return
+    agent.errand = null
+    const partner = e.with
+    if (partner?.errand?.with === agent) partner.errand = null
+    // The visitor walks home; the host never left.
+    if (e.kind === 'visit' && agent.state === 'at-site') {
+      agent.state = 'walking'
+      agent.stateAge = 0
+      agent.pathVersion = -1
+    }
+  }
+
   _faceToward(agent, point, dt) {
     // Stand a little back from the build site and look at it.
     const dx = point.x - agent.pos.x
@@ -1126,7 +1292,7 @@ export class Astronauts {
       return
     }
 
-    const loop = agent.loop
+    const loop = agent.errand?.phase === 'talking' ? FACE_LOOPS.talking : agent.loop
     if (!loop || !loop.length) {
       agent.faceFrame = FACE.idle
       return
@@ -1149,7 +1315,7 @@ export class Astronauts {
    * cannot moonwalk — the same rule the old hand-written cycle followed, applied to a real
    * one instead.
    */
-  _animate(agent, dt, anim) {
+  _animate(agent, dt, anim, elapsed) {
     const rig = this.rig
     if (!rig) return
 
@@ -1182,6 +1348,13 @@ export class Astronauts {
           break
         default:
           key = 'idle'
+          // Mid-conversation: the visitor waves hello, then the two take turns gesturing on
+          // a beat offset between them, so they never move in unison.
+          if (agent.errand?.phase === 'talking') {
+            const e = agent.errand
+            if (e.kind === 'visit' && elapsed - e.since < 1.7) key = 'wave'
+            else key = Math.floor((elapsed + agent.talkPhase) / 3.4) % 2 === 0 ? 'interact' : 'idleAlt'
+          }
       }
     }
 

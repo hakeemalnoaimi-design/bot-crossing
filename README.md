@@ -124,10 +124,44 @@ thread can only ever be doing one thing. First match wins:
 | PR merged | Jumps, confetti, heart eyes | `✓` |
 | Unread | **Stops and waits on you** | `?` |
 | Nothing for 3 days | Sits down and sleeps, `z` bubbles | — |
-| Anything else | Potters around its plot | — |
+| Anything else | Potters around its plot, and now and then goes visiting | — |
 
 Only the states that want something from you get a badge. With most of a real thread list
 sitting quiet, a symbol over every astronaut buries the one `?` that actually matters.
+
+### The island when nothing is happening
+
+Most threads are idle most of the time, and a map that is only alive while something runs
+is a map that is usually frozen. So the quiet state is where the ambient life lives, and
+none of it carries information — it is scenery, and it stays out of the way of the states
+that do mean something:
+
+- **Errands.** Every minute or two an idle builder walks over to another idle builder —
+  usually on a different plot, routed round the buildings like any other walk — waves hello,
+  and the two stand and talk for ten seconds or so, taking turns to gesture, before the
+  visitor walks home. Only the idle state takes part: a builder that is working, waiting,
+  stuck, celebrating or asleep is saying something and is never interrupted, and a dormant
+  one is never visited either. At most a fifth of the idle crew is out at once.
+- **Gulls.** Three loose flocks wheel over the shore on laps that take minutes, each bird on
+  a loop of its own, flapping or gliding on its own clock. One instanced draw.
+- **Boats.** A few dhows make slow laps of the island just off the beach, riding a small
+  swell. Only on a world with a sea. One instanced draw.
+- **Sand.** Bahrain's weather is sand on the wind: it all moves the same way, low over the
+  ground, and settles and skitters rather than hanging in the air. Same particle pool as the
+  sparks and the confetti; Mars keeps its dust and Terra its pollen.
+- **Palms** bend in the wind, more the further up the plant, on a phase taken from where
+  they stand — so a stand moves as a stand. Vertex shader; costs nothing.
+- **Dusk is an event.** Each plot has its own moment in the evening when its lamps strike —
+  one after another, stuttering like tubes before they hold — and throw a pool of light on
+  the deck under them, and each building lights its windows at a moment of its own. Across
+  the map the lights come on a plot at a time through golden hour, rather than the whole
+  island fading up together.
+
+All of it is deterministic where it can be (flock paths, lamp order, boat lanes) and cheap
+where it must be: two instanced draws, a handful of uniforms, and a few matrix writes a
+frame. It is also the reason the shoreline moved in from 100 units to 74 — from the resting
+view, the sea used to be out of frame entirely, and an island whose water cannot be seen is
+a desert.
 
 Zone names follow the same rule: a plot shows its name only while somebody there is working,
 waiting or stuck. Everything else is nameless until you point at it. The plate itself is just
