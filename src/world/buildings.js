@@ -346,7 +346,12 @@ function decorate(material, uniforms) {
          // would cut them off a building that is otherwise finished.
          float ground = uMinY + ( 1.0 - uProgress ) * ( uMaxY - uMinY );
          if ( vLocalY < ground - 0.001 ) discard;
-         int cell = atlasCell();`
+         int cell = atlasCell();
+         // A contact shadow where the structure meets the deck: the lowest half-unit of
+         // every building shades toward the ground it stands on. The shadow map cannot
+         // draw this — at a texel every six centimetres the crease under a wall is lost —
+         // and it is most of what makes a building look set down rather than placed.
+         float footAO = 1.0 - 0.28 * ( 1.0 - smoothstep( 0.0, 0.55, vLocalY - ground ) );`
       )
       // The accent repaint. Luminance carries the swatch's own gradient across, so the trim
       // keeps its shading instead of going flat the moment it changes colour.
@@ -357,7 +362,8 @@ function decorate(material, uniforms) {
          if ( accentAmount > 0.0 ) {
            float lum = dot( diffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
            diffuseColor.rgb = mix( diffuseColor.rgb, uAccent * clamp( lum * 1.9, 0.3, 1.5 ), accentAmount );
-         }`
+         }
+         diffuseColor.rgb *= footAO;`
       )
       // Per-cell PBR: painted panels, brushed metal and photovoltaic glass in one texture.
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = uCellRoughness[ cell ];')
@@ -367,9 +373,11 @@ function decorate(material, uniforms) {
         `#include <emissivemap_fragment>
          // Lamps and beacons, flagged per vertex when the recipe placed them.
          totalEmissiveRadiance += diffuseColor.rgb * vEmissive * ( 0.25 + uLit * 2.4 );
-         // Window strips and trim come on in the evening, in the repo's own colour — at
-         // this building's own moment, see \`lightsAt\`.
-         totalEmissiveRadiance += uAccent * uCellAccent[ cell ] * uLit * 1.15;
+         // Window strips and trim come on in the evening — at this building's own moment,
+         // see \`lightsAt\` — in the repo's colour pulled toward lamplight. A pearl-white
+         // accent lit at full strength was a white blaze the bloom pass turned into a blob;
+         // amber through a pale tint is what a lit window actually looks like from outside.
+         totalEmissiveRadiance += mix( uAccent, vec3( 1.0, 0.76, 0.46 ), 0.6 ) * uCellAccent[ cell ] * uLit * 0.75;
          // The construction line: a bright band riding just above the ground it rises from.
          float band = 1.0 - smoothstep( 0.0, 0.22, vLocalY - ground );
          totalEmissiveRadiance += uAccent * band * ( 1.0 - step( 0.999, uProgress ) ) * 1.5;`

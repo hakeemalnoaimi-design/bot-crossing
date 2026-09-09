@@ -324,10 +324,43 @@ under **View → Return to isometric**.
 
 ## Planets and light
 
-Three worlds — **Luna**, **Mars**, **Terra** — and a full day/night cycle you can scrub, let
-run, or set to **Live**, which follows this machine's own clock so the colony's light matches
-the light out of your window. A planet is a bag of colours and two switches; terrain, scatter, sky and lighting all
-read from the same preset, so a fourth world is a data change rather than a code change.
+Four worlds — **Bahrain**, then **Luna**, **Mars** and **Terra** — and a full day/night cycle
+you can scrub, let run, or set to **Live**, which follows the Bahrain clock so the island's
+light matches the light in the office. A planet is a bag of colours and a few switches;
+terrain, scatter, sky and lighting all read from the same preset, so a fifth world is a data
+change rather than a code change.
+
+### How Bahrain is lit
+
+- **One key light, warm.** The sun is warm even at noon — a Gulf sun is white overhead, but
+  a warm key against a cool sky fill is what the eye reads as sunlight, and the sky's own
+  environment map supplies the cool. It goes golden toward the horizon.
+- **The moon takes over after dark.** The same directional light swings round through dusk
+  to where the moon hangs and cools off, so night has a key and a shadow direction of its own
+  — long, soft, the other way — and the water has a moon on it. It used to keep the sun on at
+  a tenth of its strength, shining *up* from under the ground, plus a second light from
+  nowhere to hide that; the second light is gone, and every lit pixel is cheaper for it.
+- **Contact shadows.** The shadow map is soft-edged (a couple of texels of dithered disc),
+  but at a texel every six centimetres it cannot draw the crease where a wall meets the deck,
+  and that crease is most of what makes a thing look set down. So the lowest half-unit of
+  every building shades toward the ground in the shader, and every builder stands in a soft
+  dark disc of its own.
+- **The water moves.** Three slow sine waves tilt the normal in world space, which is all it
+  takes for the key light's highlight to break into a field of glints that drift across the
+  swell — sun by day, moon by night — and the sea goes from turquoise shallows to deep Gulf
+  blue at night.
+- **Windows are amber**, not the zone's colour at full blast: the accent pulled toward
+  lamplight, at a strength the bloom pass turns into a glow rather than a blob.
+- **Fog follows the night sky.** By day it leans toward the sand-coloured haze; after dark it
+  is the horizon and nothing else. A sand-coloured fog at midnight painted a bright band
+  across the far ground under an indigo sky.
+
+One bug fell out of looking closely. A building's rise eases toward finished but never
+arrives, and the per-frame step used to drop below the update threshold at about 98% —
+where the shader still counted the structure as under construction and lit a band round its
+foot in the zone's accent, for as long as the page was open. Every finished building on the
+map had a glowing base. That band was most of what made the island read as blown out by day
+and as a field of white rings at night; the rise now lands.
 
 ### The sky is the HDRI
 

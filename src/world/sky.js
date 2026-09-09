@@ -178,6 +178,13 @@ const SUN_APEX = 0.95
 /** Half-width of the shadow camera, in metres, centred on whatever you are looking at. */
 const SHADOW_EXTENT = 30
 /**
+ * Where the moon hangs, and so where its light comes from after dark. The same direction
+ * the companion body is parked in, so the light and the thing casting it agree.
+ */
+const MOON_DIR = new THREE.Vector3(-0.55, 0.5, -0.66).normalize()
+/** Moonlight for a world that does not name its own: cool, and about a fifth of a sun. */
+const DEFAULT_MOONLIGHT = { color: 0x9fb3d9, intensity: 0.45 }
+/**
  * The focus is snapped to this grid before the shadow camera moves. Panning a shadow map
  * by sub-texel amounts makes every shadow edge crawl; snapping trades a little slack at
  * the frustum edge for edges that hold still.
@@ -197,6 +204,8 @@ export class Sky {
     scene.add(this.group)
 
     this.sunDir = new THREE.Vector3(0, 1, 0)
+    /** Where the key light actually shines from: the sun by day, the moon by night. */
+    this.keyDir = new THREE.Vector3(0, 1, 0)
     /** When the wall clock was last read. Zero means "on the next frame". */
     this._clockAt = 0
     this.dayFactor = 1
@@ -314,6 +323,10 @@ export class Sky {
     // peter-panning that a negative depth bias causes on these small characters.
     this.sun.shadow.bias = 0
     this.sun.shadow.normalBias = 0.09
+    // A couple of texels of blur on the edge. The sampler dithers a small disc per pixel,
+    // so this is what turns a hard-edged shadow with stair-steps into a soft one — and at
+    // this radius the dither reads as softness rather than as grain.
+    this.sun.shadow.radius = 2.2
     this.sun.shadow.mapSize.setScalar(this.settings.shadowSize || 1024)
     this.focus = new THREE.Vector3()
     this.sun.target.position.set(0, 0, 0)
@@ -322,10 +335,11 @@ export class Sky {
     this.hemi = new THREE.HemisphereLight(0x8899cc, 0x4a4038, 0.6)
     this.group.add(this.hemi)
 
-    // A cool rim from the opposite side keeps night silhouettes from going fully black.
-    this.fill = new THREE.DirectionalLight(0x8fa8d8, 0.2)
-    this.fill.position.set(-40, 30, -30)
-    this.group.add(this.fill)
+    // One directional light, not two. There used to be a second, a cool fill from nowhere
+    // in particular, to keep night silhouettes from going black — and every lit pixel on
+    // screen paid for a second full lighting evaluation, all day long, for it. Night has a
+    // key of its own now: the moon, see `setTime`. The sky's own environment map and the
+    // hemisphere light carry the fill.
   }
 
   _buildStars() {
@@ -486,9 +500,9 @@ export class Sky {
     this._placeSun()
   }
 
-  /** Sun position and target both hang off the focus point, so the frustum travels with it. */
+  /** Key light and target both hang off the focus point, so the frustum travels with it. */
   _placeSun() {
-    this.sun.position.copy(this.sunDir).multiplyScalar(150).add(this.focus)
+    this.sun.position.copy(this.keyDir).multiplyScalar(150).add(this.focus)
     this.sun.target.position.copy(this.focus)
     this.sun.target.updateMatrixWorld()
   }
@@ -521,8 +535,18 @@ export class Sky {
 
     // Sun light: warm and weak at the horizon, full and neutral overhead.
     const sunColor = this._c1.set(planet.sun.color).lerp(this.duskColor, golden * 0.7 * planet.atmosphere)
-    this.sun.color.copy(sunColor)
-    this.sun.intensity = THREE.MathUtils.lerp(planet.sun.night, planet.sun.intensity, day)
+
+    // The key light is the sun by day and the moon after dark, one directional light either
+    // way. Night used to keep the sun on at a tenth of its strength — shining *up* from
+    // under the ground, since that is where the sun is at night — and lean on a second
+    // light to hide it. Handing the key to the moon gives the night a key direction of its
+    // own: long, soft shadows the other way, and water with a moon on it. Blended through
+    // dusk, so the shadows swing round rather than snapping.
+    const moon = planet.moonlight || DEFAULT_MOONLIGHT
+    const toSun = THREE.MathUtils.smoothstep(day, 0.05, 0.6)
+    this.keyDir.copy(MOON_DIR).lerp(this.sunDir, toSun).normalize()
+    this.sun.color.copy(this._c2.set(moon.color).lerp(sunColor, toSun))
+    this.sun.intensity = THREE.MathUtils.lerp(moon.intensity, planet.sun.intensity, day)
     this._placeSun()
 
     this.hemi.color.set(planet.ambient.sky)
@@ -530,10 +554,7 @@ export class Sky {
     // The hemisphere light drops right back when IBL is carrying the ambient — running both
     // at full strength double-counts the sky and flattens everything out.
     const hemiScale = this.settings.get('ibl') ? 0.55 : 1
-    this.hemi.intensity = THREE.MathUtils.lerp(planet.ambient.intensity * 0.22, planet.ambient.intensity, day) * hemiScale
-    // Enough of a bounce that surfaces turned away from the sun read as dark rather than as
-    // holes in the image. On an airless world this stands in for regolith bounce.
-    this.fill.intensity = THREE.MathUtils.lerp(0.34, 0.26, day)
+    this.hemi.intensity = THREE.MathUtils.lerp(planet.ambient.intensity * 0.3, planet.ambient.intensity, day) * hemiScale
 
     // Sky gradient.
     const top = this._c1.copy(this.nightTop).lerp(this.dayTop, day)
@@ -555,7 +576,10 @@ export class Sky {
     this.companionBody.material.emissiveIntensity = 0.25 + (1 - day) * 0.55
 
     // Fog follows the horizon, or the whole world looks like it is behind glass at night.
-    this.scene.fog.color.copy(bottom).lerp(this._c1.set(planet.fog.color), 0.55)
+    // By day it leans toward the world's own haze colour; after dark it is the night sky's
+    // horizon and nothing else — a sand-coloured fog at midnight painted a bright band
+    // across the far ground under an indigo sky, which is what this used to do.
+    this.scene.fog.color.copy(bottom).lerp(this._c1.set(planet.fog.color), 0.55 * day)
     this._envDirty = true
   }
 

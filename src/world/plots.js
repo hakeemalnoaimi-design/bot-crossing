@@ -738,8 +738,10 @@ export class Plot {
   /** Night lighting, plus a pulse on the border when this plot holds something urgent. */
   setNight(night, urgent, elapsed) {
     if (this.borderMaterial) {
+      // Runway-edge lighting, not a neon sign: bright enough after dark to draw the zone's
+      // outline, not so bright that a pale accent blooms into a white halo round the plot.
       this.borderMaterial.emissiveIntensity =
-        0.3 + night * 1.4 + (urgent ? 0.4 + Math.sin(elapsed * 3.4) * 0.32 : 0)
+        0.25 + night * 0.75 + (urgent ? 0.4 + Math.sin(elapsed * 3.4) * 0.32 : 0)
     }
     // The lamps come on at this plot's own moment in the evening, and go off at dawn — a
     // little later than they came on, so a sky hovering at the line does not flick them.

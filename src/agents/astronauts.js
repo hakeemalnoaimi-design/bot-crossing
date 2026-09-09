@@ -232,6 +232,14 @@ export class Astronauts {
     // than suit white, so it reads as a tool at the distance the colony is watched from.
     parts.hammer = this._mesh(hammerGeometry(R), suit(0.62, { vertexColors: true }), capacity, true)
 
+    // A soft dark disc under each builder: the contact shadow the shadow map is too coarse
+    // to draw, and what keeps a figure standing *on* the deck rather than a pixel above it.
+    // Multiplied into whatever is under it, so it is a shadow on sand and on plate alike.
+    const blobGeo = new THREE.CircleGeometry(0.62 / CREW_SCALE, 18)
+    blobGeo.rotateX(-Math.PI / 2)
+    parts.blob = this._mesh(blobGeo, blobMaterial(), capacity, false)
+    parts.blob.renderOrder = 1
+
     for (const mesh of Object.values(parts)) {
       mesh.frustumCulled = false // one bounding volume for every agent everywhere is useless
       this.group.add(mesh)
@@ -496,7 +504,7 @@ export class Astronauts {
   _applyShadowFlags() {
     const on = this.settings.shadowSize > 0
     for (const [name, mesh] of Object.entries(this.parts)) {
-      mesh.castShadow = on && name !== 'tip' && name !== 'lamp'
+      mesh.castShadow = on && name !== 'tip' && name !== 'lamp' && name !== 'blob'
     }
     for (const lod of this.lods) {
       lod.helmet.castShadow = on
@@ -1382,7 +1390,7 @@ export class Astronauts {
   // ── writing the instance buffers ────────────────────────────────────────────────────
 
   _writeMatrices(elapsed, anim, camera) {
-    const { pack, antenna, tip, lamp, hammer } = this.parts
+    const { pack, antenna, tip, lamp, hammer, blob } = this.parts
     const lods = this.lods
     const rig = this.rig
     const root = this._m
@@ -1434,6 +1442,10 @@ export class Astronauts {
       q.setFromEuler(e)
       v.set(agent.pos.x, agent.pos.y, agent.pos.z)
       root.compose(v, q, one.setScalar(s * CREW_SCALE))
+      // The shadow stays on the ground when the builder does not — a celebrating hop lifts
+      // the figure and leaves its shadow where its feet will land.
+      v.y = (agent.groundY || 0) + 0.03
+      blob.setMatrixAt(i, child.compose(v, q, one))
       one.setScalar(1)
 
       if (lod.crew) {
@@ -1734,6 +1746,35 @@ function sphereCap(radius, phiSpread, thetaSpread, wSeg = 18, hSeg = 12) {
     Math.PI / 2 - thetaSpread / 2,
     thetaSpread
   )
+}
+
+/**
+ * The contact shadow under a builder: black, faded in from the rim to the centre, laid over
+ * whatever is under it. Unlit and unfogged, so it is the same shadow on sand and on plate.
+ */
+function blobMaterial() {
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    transparent: true,
+    depthWrite: false,
+    fog: false,
+  })
+  mat.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n varying vec2 vBlob;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n vBlob = uv;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\n varying vec2 vBlob;')
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+         float d = length( vBlob - 0.5 ) * 2.0;
+         diffuseColor.rgb = vec3( 0.0 );
+         diffuseColor.a = pow( max( 0.0, 1.0 - d ), 1.4 ) * 0.45;`
+      )
+  }
+  mat.customProgramCacheKey = () => 'crew-blob'
+  return mat
 }
 
 function ring(inner, outer, color, opacity) {

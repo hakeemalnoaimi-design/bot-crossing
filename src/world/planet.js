@@ -20,6 +20,8 @@ import { atlasTexture, hasPart, part } from './kit.js'
  *   `accent`       — the default building accent, for a structure with no zone colour
  *   `weather`      — what drifts through the air: `sand`, `dust` or `pollen`; `dust` is how much
  *   `wind`         — which way the sand goes, as a unit-ish direction on the ground
+ *   `moonlight`    — the key light after dark, colour and intensity
+ *   `farDarken`    — how hard the far ground is dimmed toward the horizon (0.75 if unsaid)
  */
 
 /** Night falling, for the water. Written once a frame by the colony. */
@@ -45,10 +47,18 @@ export const PLANETS = {
     night: { top: 0x151b3e, horizon: 0x0b1f3a },
     dusk: 0xe8763a,
     fog: { color: 0xd6c39c, near: 88, far: 245 },
-    sun: { color: 0xfff2d8, intensity: 2.5, night: 0.11 },
-    ambient: { sky: 0x9fcfe0, ground: 0x8a7448, intensity: 0.95 },
+    // Warm even at noon: a Gulf sun is white overhead, but a warm key against a cool blue
+    // sky fill is what the eye reads as sunlight, and the environment map supplies the cool.
+    sun: { color: 0xffe3bc, intensity: 2.4, night: 0.11 },
+    // After dark the key is the moon — cool, and enough to give the night its own shadows.
+    moonlight: { color: 0x9fb4dc, intensity: 0.34 },
+    ambient: { sky: 0xa6d3e6, ground: 0x94805a, intensity: 1.0 },
     atmosphere: 1,
     craters: 0,
+    // The far ground is dimmed less than on the other worlds: the sea is the horizon here,
+    // and a beach crushed toward black between pale sand and turquoise water reads as a
+    // tide line of tar.
+    farDarken: 0.45,
     // Low, because dunes are dunes and not hills. The island shaping below does the shape.
     roughness: 0.5,
     scatter: 'palms',
@@ -226,7 +236,7 @@ export function createTerrain(planet, detail, seed = 1337) {
     c.lerp(tint, Math.max(0, speck) * 0.22)
     // Darken the far field hard so the eye settles on the colony and the hills read as a
     // silhouette rather than as more ground competing with the plots for attention.
-    c.multiplyScalar(1 - THREE.MathUtils.smoothstep(dist, COLONY_RADIUS * 0.7, GROUND_SIZE * 0.35) * 0.75)
+    c.multiplyScalar(1 - THREE.MathUtils.smoothstep(dist, COLONY_RADIUS * 0.7, GROUND_SIZE * 0.35) * (planet.farDarken ?? 0.75))
 
     // Water is laid over that darkening rather than under it: a sea crushed to near-black
     // by the far-field falloff is just more silhouette, and the turquoise is the point.
@@ -283,30 +293,54 @@ function seaMix(dist, planet) {
  * Water is also flat and horizontal, which means it faces almost none of a low sun. Left at
  * the ground's own roughness it goes matte grey at dusk; a smoother, slightly metallic
  * surface takes its colour from the sky instead, which is what a shallow lagoon does.
+ *
+ * And it moves. The normal is tilted by three slow sine waves in world space, which is all
+ * it takes for the key light's highlight to break up into a field of glints that drift
+ * across the water — the sun on it by day, the moon by night. A flat plane catches the sun
+ * in one spot; this catches it everywhere the swell faces it.
  */
 function makeWet(material, sea) {
   const deep = new THREE.Color(sea.deep)
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uNight = waterUniforms.uNight
     shader.uniforms.uDeep = { value: deep }
+    shader.uniforms.uSwell = windUniforms.uWind
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\n attribute float aWater;\n varying float vWater;')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\n vWater = aWater;')
+      .replace('#include <common>', '#include <common>\n attribute float aWater;\n varying float vWater;\n varying vec2 vSea;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n vWater = aWater;\n vSea = ( modelMatrix * vec4( transformed, 1.0 ) ).xz;')
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\n varying float vWater;\n uniform float uNight;\n uniform vec3 uDeep;')
+      .replace(
+        '#include <common>',
+        '#include <common>\n varying float vWater;\n varying vec2 vSea;\n uniform float uNight;\n uniform vec3 uDeep;\n uniform float uSwell;'
+      )
       .replace(
         '#include <color_fragment>',
         '#include <color_fragment>\n diffuseColor.rgb = mix( diffuseColor.rgb, uDeep, vWater * uNight );'
+      )
+      // The ripple is a world-space tilt, and `normal` here is in view space, so it is
+      // turned by the view matrix on the way in. Only where there is water.
+      .replace(
+        '#include <normal_fragment_begin>',
+        `#include <normal_fragment_begin>
+         if ( vWater > 0.001 ) {
+           float t = uSwell;
+           vec2 p = vSea;
+           float r1 = sin( p.x * 0.55 + p.y * 0.35 + t * 1.1 );
+           float r2 = sin( p.x * -0.3 + p.y * 0.7 + t * 0.8 );
+           float r3 = sin( p.x * 1.3 + p.y * 1.1 + t * 1.9 ) * 0.5;
+           vec3 tilt = vec3( r1 + r3, 0.0, r2 - r3 ) * 0.05 * vWater;
+           normal = normalize( normal + ( viewMatrix * vec4( tilt, 0.0 ) ).xyz );
+         }`
       )
       // `roughnessFactor` and `metalnessFactor` are declared by these two chunks, so the
       // water's own values have to be applied after them rather than up at the colour.
       .replace(
         '#include <roughnessmap_fragment>',
-        '#include <roughnessmap_fragment>\n roughnessFactor = mix( roughnessFactor, 0.22, vWater );'
+        '#include <roughnessmap_fragment>\n roughnessFactor = mix( roughnessFactor, 0.16, vWater );'
       )
       .replace(
         '#include <metalnessmap_fragment>',
-        '#include <metalnessmap_fragment>\n metalnessFactor = mix( metalnessFactor, 0.35, vWater );'
+        '#include <metalnessmap_fragment>\n metalnessFactor = mix( metalnessFactor, 0.3, vWater );'
       )
   }
   // Two materials that compile to different programs must not share a cache key.

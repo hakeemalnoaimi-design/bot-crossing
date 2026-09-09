@@ -779,8 +779,15 @@ export class Colony {
     for (const [id, entry] of this.buildings) {
       // A running thread's site creeps upward while you watch it.
       if (!entry.retiring && this._isLive(id)) entry.target = Math.min(1, entry.target + LIVE_GROWTH * dt)
-      const next = THREE.MathUtils.damp(entry.progress, entry.target, 1.8, dt)
-      if (Math.abs(next - entry.progress) > 0.0005) {
+      let next = THREE.MathUtils.damp(entry.progress, entry.target, 1.8, dt)
+      // Land on the target rather than creeping toward it forever. The ease converges but
+      // never arrives, and the per-frame step used to fall under the update threshold at
+      // about 0.98 — where the building shader still counts the structure as *under
+      // construction*: a glowing band round the foot of every finished building, in the
+      // zone's accent, for as long as the page was open. That band was most of what made
+      // the island read as blown out by day and as a field of white rings at night.
+      if (Math.abs(entry.target - next) < 0.01) next = entry.target
+      if (next !== entry.progress) {
         entry.progress = next
         entry.mesh.userData.setProgress(next)
       }
