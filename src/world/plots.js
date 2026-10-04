@@ -17,10 +17,19 @@ import { mulberry } from './planet.js'
  * repo lands where you are already looking and quiet ones ring the edge.
  */
 
-/** The default zone colours. A world may bring its own — see `palette` on a planet preset. */
+/**
+ * The default zone colours. A world may bring its own — see `palette` on a planet preset.
+ *
+ * Twenty-four, because a real roster outgrew twelve: with seventeen zones, five of them had
+ * to share a colour with another. The second dozen were chosen by farthest-point search in
+ * Lab against the first, and held under the deck's lightness cap (see `DECK_MAX_LIGHTNESS`)
+ * so that no deck colour moved. The first twelve are untouched.
+ */
 export const PLOT_PALETTE = [
   0xc96442, 0x4f9a63, 0x4f7ec9, 0xb8942a, 0x8b5cc9, 0xc94f8b,
   0x3fa8a0, 0xc97f4f, 0x6f8f4f, 0x5c7fc9, 0xc95c5c, 0x7f6fc9,
+  0x86698b, 0xb3c04d, 0xc04db3, 0x4da5c0, 0x996150, 0x4dc06c,
+  0xa89b7e, 0x893fa0, 0x69818b, 0x4dc0a5, 0x6186b8, 0xa03f7c,
 ]
 
 /**

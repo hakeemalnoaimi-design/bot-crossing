@@ -1,4 +1,4 @@
-import { PRESETS, PLANETS_ORDER } from './hud-data.js'
+import { PRESETS, PLANETS_ORDER, STATUS_FILTERS, filterThreads, shortPath } from './hud-data.js'
 import { PLANETS } from '../world/planet.js'
 import { TIMES, systemTimeOfDay, WORLD_TIMEZONE } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
@@ -47,6 +47,9 @@ const ICON = {
   orbit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10.2" ry="4.6" transform="rotate(-24 12 12)"/><circle cx="21" cy="8.2" r="1.5" fill="currentColor" stroke="none"/></svg>`,
 }
 
+/** The most rows the search results or the archived list will draw at once. */
+const RESULT_CAP = 150
+
 const STAT_DEFS = [
   { key: 'working', label: 'building', cls: 'working' },
   { key: 'waiting', label: 'need you', cls: 'waiting' },
@@ -69,14 +72,27 @@ export class Hud {
     root.appendChild(this.el)
 
     this.$ = (sel) => this.el.querySelector(sel)
+    // Icon-only buttons say what they do in `title`, which is not a name a screen reader reads
+    // reliably. The shortcut in brackets stays in the tooltip and out of the name.
+    for (const b of this.el.querySelectorAll('button[title]:not([aria-label])')) {
+      if (!b.textContent.trim()) b.setAttribute('aria-label', b.title.replace(/\s*\(.*\)$/, ''))
+    }
 
     this.health = null
     this.coverage = null
     this.asleepOpen = false
+    this.archivedOpen = false
+
+    // The search block: what was typed, which chips are on, and every thread to search through.
+    this.find = { query: '', sources: new Set(), statuses: new Set() }
+    this.directory = []
+    this.archived = []
+    this.selectedId = null
 
     this._buildStats()
     this._buildSettings()
     this._buildAvatar()
+    this._buildFind()
     this._wire()
     this.syncSettings()
     // "Updated 12s ago" has to keep counting between polls, or it reads as fresh for as long as
@@ -94,13 +110,63 @@ export class Hud {
       b.className = `stat ${def.cls}`
       b.type = 'button'
       b.dataset.key = def.key
-      b.title = def.key === 'agents' ? 'Fly to the next builder' : `Fly to the next builder that is ${def.label}`
-      b.innerHTML = `<i class="pip"></i><span class="n">0</span><span class="lbl">${def.label}</span>`
+      b.title =
+        def.key === 'agents'
+          ? 'Builders on the island right now. Click to fly to the next one'
+          : `Fly to the next builder that is ${def.label}`
+      // The label is hidden at narrow widths and the pip is only a colour, so the button says
+      // the whole thing itself — and `setStats` keeps the number in it current.
+      b.setAttribute('aria-label', `0 ${def.label}`)
+      b.innerHTML = `<i class="pip" aria-hidden="true"></i><span class="n">0</span><span class="lbl">${def.label}</span>`
       b.type = 'button'
       b.addEventListener('click', () => this.actions.focusStatus?.(def.key))
       wrap.appendChild(b)
       this.statEls[def.key] = b
     }
+  }
+
+  /**
+   * The search box and its chips. The status chips never change; the source chips are drawn
+   * from whichever harnesses the directory turns out to hold, so an install with only Claude
+   * Code has one chip and one with n8n beside it has two.
+   */
+  _buildFind() {
+    const wrap = this.$('.find .status-chips')
+    this.statusChips = new Map()
+    for (const def of STATUS_FILTERS) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `chip ${statusClass(def.id)}`
+      b.title = def.title
+      b.setAttribute('aria-pressed', 'false')
+      b.innerHTML = `<span>${def.label}</span><span class="c"></span>`
+      b.addEventListener('click', () => this._toggleFilter(this.find.statuses, def.id))
+      wrap.appendChild(b)
+      this.statusChips.set(def.id, b)
+    }
+
+    const input = this.$('#find-q')
+    // Typing rewrites a list of up to four hundred rows. Waiting for a pause costs nothing a
+    // person can feel and saves doing it once per letter.
+    input.addEventListener('input', () => {
+      this.find.query = input.value
+      clearTimeout(this._findTimer)
+      this._findTimer = setTimeout(() => this._renderResults(), 100)
+    })
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        this.clearSearch()
+        input.blur()
+      } else if (e.key === 'Enter') {
+        // Straight to the best match, the way a command palette would.
+        this.$('.results .thread')?.click()
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        this.$('.results .thread')?.focus()
+      }
+    })
+    this.$('#btn-find-clear').addEventListener('click', () => this.clearSearch())
   }
 
   _buildSettings() {
@@ -281,6 +347,7 @@ export class Hud {
     b.type = 'button'
     b.className = 'toggle'
     b.setAttribute('role', 'switch')
+    b.setAttribute('aria-label', label)
     b.addEventListener('click', () => this.settings.set(key, !this.settings.get(key)))
     row.appendChild(b)
     this.controls.push({
@@ -297,6 +364,7 @@ export class Hud {
     const row = this._row(label, hint)
     const sel = document.createElement('select')
     sel.className = 'select'
+    sel.setAttribute('aria-label', label)
     for (const [value, text] of options) {
       const o = document.createElement('option')
       o.value = value
@@ -322,6 +390,7 @@ export class Hud {
     const input = document.createElement('input')
     input.type = 'range'
     input.className = 'slider'
+    input.setAttribute('aria-label', label)
     input.min = min
     input.max = max
     input.step = step
@@ -382,6 +451,7 @@ export class Hud {
     on('#btn-copy-path', 'click', () => this.actions.copyProjectPath?.())
     on('#btn-hide-project', 'click', () => this.actions.hideProject?.())
     on('#btn-hidden-toggle', 'click', () => this.toggleHiddenList())
+    on('#btn-archived-toggle', 'click', () => this.toggleArchivedList())
     on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
     on('.help', 'click', (e) => {
@@ -408,26 +478,35 @@ export class Hud {
       this._last['stat:' + def.key] = n
       el.querySelector('.n').textContent = String(n)
       el.dataset.empty = String(n === 0)
+      el.setAttribute('aria-label', `${n} ${def.label}`)
     }
   }
 
   /**
-   * "84 of 445 shown · 361 asleep", under the counters. Hidden when everything is on the map,
-   * because a line that always says "445 of 445" is a line nobody reads when it stops being true.
+   * "76 of 387 on the map · 308 dormant · 3 over capacity", under the counters. Hidden when
+   * everything is on the map, because a line that always says "445 of 445" is a line nobody
+   * reads when it stops being true.
+   *
+   * The two reasons are told apart because they are different facts. Dormant is a rule — nothing
+   * for three days, and left off on purpose — while over capacity is the island running out of
+   * builders or building slots, and the thing worth knowing about if it is not zero.
    */
   setCoverage(coverage) {
     this.coverage = coverage
     const el = this.$('.scan .coverage')
     const partial = Boolean(coverage) && coverage.shown < coverage.total
-    const text = partial
-      ? `${coverage.shown} of ${coverage.total} shown · ${coverage.total - coverage.shown} ${coverage.asleep ? 'asleep' : 'not drawn'}`
-      : ''
+    const bits = []
+    if (partial) {
+      if (coverage.dormant) bits.push(`${coverage.dormant} dormant`)
+      if (coverage.over) bits.push(`${coverage.over} over capacity`)
+    }
+    const text = partial ? `${coverage.shown} of ${coverage.total} on the map${bits.length ? ` · ${bits.join(' · ')}` : ''}` : ''
     if (this._last.coverage === text) return
     this._last.coverage = text
     el.textContent = text
     el.hidden = !partial
     el.title = partial
-      ? 'The rest have no builder: the crew is capped, or the zone is out of building slots. They are listed under Asleep in each zone.'
+      ? 'On the map is the number of builders you can see. Dormant threads have been quiet for three days. Over capacity means the crew is capped or the zone is out of building slots — those are listed under Asleep in each zone. Search finds every one of them.'
       : ''
   }
 
@@ -565,6 +644,183 @@ export class Hud {
   }
 
   /**
+   * Every thread the colony knows about, drawn or not — what the search box looks through.
+   * Called on every poll with the whole list, so it only does work when something in it moved.
+   */
+  setDirectory(items) {
+    // The minute is in the signature for the same reason it is in `setProject`'s: the rows say
+    // "4m ago", and a list nobody touched should not keep saying it for an hour.
+    const signature =
+      `${Math.floor(Date.now() / 60000)}~` +
+      items.map((t) => `${t.id}:${t.status}:${t.title}:${t.drawn ? 1 : 0}:${t.lastActivityAt}:${t.lastRunAt}`).join('|')
+    if (this._last.directory === signature) return
+    this._last.directory = signature
+    this.directory = items
+
+    const sources = new Map()
+    for (const t of items) if (t.harness && !sources.has(t.harness)) sources.set(t.harness, t.harnessName || t.harness)
+    // A chip for a harness that has gone cannot be un-pressed, and would filter everything out.
+    for (const id of [...this.find.sources]) if (!sources.has(id)) this.find.sources.delete(id)
+    const sourceKey = [...sources].map(([id, name]) => `${id}:${name}`).join('|')
+    if (this._last.sourceChips !== sourceKey) {
+      this._last.sourceChips = sourceKey
+      const wrap = this.$('.find .source-chips')
+      wrap.innerHTML = ''
+      this.sourceChips = new Map()
+      for (const [id, name] of sources) {
+        const b = document.createElement('button')
+        b.type = 'button'
+        b.className = 'chip'
+        b.title = `Only threads from ${name}`
+        b.setAttribute('aria-pressed', 'false')
+        b.innerHTML = `<span>${escapeHtml(name)}</span><span class="c"></span>`
+        b.addEventListener('click', () => this._toggleFilter(this.find.sources, id))
+        wrap.appendChild(b)
+        this.sourceChips.set(id, b)
+      }
+      // One harness needs no chip: there is nothing to tell apart.
+      wrap.hidden = sources.size < 2
+    }
+
+    const counts = new Map()
+    for (const t of items) {
+      counts.set(t.status, (counts.get(t.status) ?? 0) + 1)
+      counts.set(`src:${t.harness}`, (counts.get(`src:${t.harness}`) ?? 0) + 1)
+    }
+    for (const [id, b] of this.statusChips) b.querySelector('.c').textContent = String(counts.get(id) ?? 0)
+    for (const [id, b] of this.sourceChips || []) b.querySelector('.c').textContent = String(counts.get(`src:${id}`) ?? 0)
+    this._renderResults()
+  }
+
+  _toggleFilter(set, id) {
+    if (!set.delete(id)) set.add(id)
+    this._renderResults()
+  }
+
+  /** True when the search block is narrowing the list at all. */
+  get searching() {
+    const f = this.find
+    return Boolean(f.query.trim()) || f.sources.size > 0 || f.statuses.size > 0
+  }
+
+  _renderResults() {
+    clearTimeout(this._findTimer)
+    const f = this.find
+    const active = this.searching
+    this.$('.side').classList.toggle('searching', active)
+    this.$('#btn-find-clear').hidden = !active
+    for (const [id, b] of this.statusChips) b.setAttribute('aria-pressed', String(f.statuses.has(id)))
+    for (const [id, b] of this.sourceChips || []) b.setAttribute('aria-pressed', String(f.sources.has(id)))
+
+    const list = this.$('.results')
+    const meta = this.$('.find .find-meta')
+    if (!active) {
+      this._last.results = null
+      meta.textContent = ''
+      list.innerHTML = ''
+      return
+    }
+
+    const signature = `${this._last.directory}~${JSON.stringify([f.query, [...f.sources], [...f.statuses]])}`
+    if (this._last.results === signature) return
+    this._last.results = signature
+
+    const hits = filterThreads(this.directory, f)
+    const shown = hits.slice(0, RESULT_CAP)
+    meta.textContent = `${hits.length} of ${this.directory.length} thread${this.directory.length === 1 ? '' : 's'}`
+    list.innerHTML = ''
+    if (!hits.length) {
+      list.innerHTML = '<div class="empty">Nothing matches. Check the spelling, or clear a filter.</div>'
+      return
+    }
+    for (const t of shown) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = `thread ${statusClass(t.status)}${t.drawn ? '' : ' nodraw'}`
+      b.dataset.id = t.id
+      b.setAttribute('aria-pressed', String(t.id === this.selectedId))
+      b.title = t.drawn
+        ? `${STATUS_LABEL[t.status] || t.status} — fly to its builder`
+        : `${STATUS_LABEL[t.status] || t.status} — no builder on the island, open it in ${t.harnessName || 'its harness'}`
+      b.innerHTML =
+        pipHtml(t.status) +
+        `<span class="t">${escapeHtml(t.title || 'Untitled thread')}</span>` +
+        `<span class="when">${whenLabel(t)}</span>` +
+        (t.drawn ? '' : '<span class="open">Open</span>') +
+        `<span class="wt">${escapeHtml(t.project || 'unknown')} · ${escapeHtml(t.harnessName || t.harness || '')}</span>`
+      b.addEventListener('click', () => (t.drawn ? this.actions.focusThread?.(t.id) : this.actions.openById?.(t.id)))
+      list.appendChild(b)
+    }
+    if (hits.length > shown.length) {
+      const more = document.createElement('div')
+      more.className = 'empty'
+      more.textContent = `${hits.length - shown.length} more — type or filter further to narrow it down`
+      list.appendChild(more)
+    }
+  }
+
+  /** Put the cursor in the search box, bringing the chrome back first if H had hidden it. */
+  focusSearch() {
+    if (!this.visible) this.toggleUi(true)
+    const input = this.$('#find-q')
+    input.focus()
+    input.select()
+  }
+
+  /** Empty the search box and turn every chip off. Says whether there was anything to clear. */
+  clearSearch() {
+    const had = this.searching
+    this.find.query = ''
+    this.find.sources.clear()
+    this.find.statuses.clear()
+    this.$('#find-q').value = ''
+    this._renderResults()
+    return had
+  }
+
+  /**
+   * What you have archived, so it can come back. Colony-only, like the archive itself: the
+   * list is `state.archived`, and Unarchive removes from it and nothing else.
+   */
+  setArchived(list) {
+    const signature = list.map((a) => `${a.id}:${a.title}`).join('|')
+    if (this._last.archived === signature) return
+    this._last.archived = signature
+    this.archived = list
+
+    this.$('.archived-block').hidden = list.length === 0
+    this.$('#btn-archived-toggle .label').textContent = `Archived (${list.length})`
+    const wrap = this.$('.archived-list')
+    wrap.innerHTML = ''
+    for (const a of list.slice(0, RESULT_CAP)) {
+      const row = document.createElement('div')
+      row.className = 'repo hidden-repo'
+      row.title = a.project ? `${a.title} — ${a.project}` : a.title
+      row.innerHTML = `<span class="n">${escapeHtml(a.title)}</span>`
+      const undo = document.createElement('button')
+      undo.type = 'button'
+      undo.className = 'btn ghost show-repo'
+      undo.title = `Put ${a.title} back on the island`
+      undo.setAttribute('aria-label', `Unarchive ${a.title}`)
+      undo.textContent = 'Unarchive'
+      undo.addEventListener('click', () => this.actions.unarchiveThread?.(a.id))
+      row.appendChild(undo)
+      wrap.appendChild(row)
+    }
+    this._syncArchivedList()
+  }
+
+  toggleArchivedList() {
+    this.archivedOpen = !this.archivedOpen
+    this._syncArchivedList()
+  }
+
+  _syncArchivedList() {
+    this.$('#btn-archived-toggle').setAttribute('aria-expanded', String(this.archivedOpen))
+    this.$('.archived-list').hidden = !this.archivedOpen
+  }
+
+  /**
    * The project sidebar: what a zone is, and the things you can do to the *repo* rather
    * than to one thread in it. Opened by clicking a zone, its name plate, its legend chip,
    * or any astronaut standing on it.
@@ -625,7 +881,7 @@ export class Hud {
       b.setAttribute('aria-pressed', String(t.id === project.selectedId))
       b.title = STATUS_LABEL[t.status] || t.status
       b.innerHTML =
-        '<i class="pip"></i>' +
+        pipHtml(t.status) +
         `<span class="t">${escapeHtml(t.title || 'Untitled thread')}</span>` +
         `<span class="when">${whenLabel(t)}</span>` +
         (t.worktree ? `<span class="wt">⑂ ${escapeHtml(t.worktree)}</span>` : '')
@@ -667,7 +923,7 @@ export class Hud {
           row.className = 'thread asleep'
           row.title = `No builder on the island — open in ${t.harness || 'its harness'}`
           row.innerHTML =
-            '<i class="pip"></i>' +
+            pipHtml(t.status) +
             `<span class="t">${escapeHtml(t.title || 'Untitled thread')}</span>` +
             `<span class="when">${whenLabel(t)}</span>` +
             '<span class="open">Open</span>'
@@ -692,9 +948,13 @@ export class Hud {
     if (!agent || !thread) {
       card.classList.remove('on')
       this.selected = null
+      this.selectedId = null
+      this._syncResultsSelection()
       return
     }
     this.selected = { agent, thread }
+    this.selectedId = thread.id
+    this._syncResultsSelection()
     card.classList.add('on')
 
     this.$('.thread-pop .title').textContent = thread.title || 'Untitled thread'
@@ -703,12 +963,30 @@ export class Hud {
     const bits = [
       `<span class="tag"><i class="swatch" style="background:${hex(agent.trim.getHex())}"></i>${escapeHtml(status)}</span>`,
     ]
+    // Which harness it came from — the card is the one place a thread's origin is always said.
+    if (thread.harnessName) bits.push(`<span class="tag">${escapeHtml(thread.harnessName)}</span>`)
+    // A workflow is switched on or off, which is the first thing to know about one.
+    if (thread.harness === 'n8n' && thread.source) {
+      bits.push(`<span class="tag wf ${thread.source === 'active' ? 'on' : 'off'}">workflow ${escapeHtml(thread.source)}</span>`)
+    }
     // The repo is the panel's own heading now, so the card says what the *thread* is.
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
     if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
     bits.push(`<span>${whenLabel(thread)}</span>`)
     meta.innerHTML = bits.join('')
+
+    // What went wrong, for a workflow: the adapter's one-line account of its last run, and the
+    // execution it is about. Claude Code threads have neither, and the block stays shut.
+    const detail = this.$('.thread-pop .detail')
+    const lines = []
+    if (thread.harness === 'n8n') {
+      const failed = thread.hasError || agent.status === 'blocked'
+      if (failed && thread.preview) lines.push(`<div class="err">${escapeHtml(thread.preview)}</div>`)
+      if (thread.ref?.executionId) lines.push(`<div class="kv">Execution <code>${escapeHtml(thread.ref.executionId)}</code></div>`)
+    }
+    detail.innerHTML = lines.join('')
+    detail.hidden = lines.length === 0
 
     const pct = Math.round((this.actions.progressFor?.(thread.id) ?? 0) * 100)
     this.$('.thread-pop .progress > i').style.width = `${pct}%`
@@ -726,6 +1004,13 @@ export class Hud {
     // worse than no control. Which threads can be re-run is the harness's business — the page
     // only reads the flag.
     this.$('#btn-retry').hidden = !thread.canRetry
+  }
+
+  /** Keep the highlighted result in step with the selected builder. */
+  _syncResultsSelection() {
+    for (const b of this.el.querySelectorAll('.results .thread')) {
+      b.setAttribute('aria-pressed', String(b.dataset.id === this.selectedId))
+    }
   }
 
   /** Disabled while a retry is on the wire, so the button cannot be clicked twice. */
@@ -858,15 +1143,36 @@ export class Hud {
     this._hintTimer = setTimeout(() => el.classList.remove('on'), ms)
   }
 
-  toast(message, kind = '') {
+  /**
+   * A line at the bottom. `action` makes it carry one button — `{ label, run }` — for the few
+   * things worth undoing, and `ms` keeps it up long enough to reach for.
+   */
+  toast(message, kind = '', { action, ms = 3600 } = {}) {
     const el = document.createElement('div')
     el.className = `toast panel ${kind}`
-    el.textContent = message
-    this.$('.toasts').appendChild(el)
-    setTimeout(() => {
+    const text = document.createElement('span')
+    text.textContent = message
+    el.appendChild(text)
+    let timer = 0
+    const dismiss = () => {
+      clearTimeout(timer)
       el.classList.add('leaving')
       setTimeout(() => el.remove(), 260)
-    }, 3600)
+    }
+    if (action) {
+      el.classList.add('has-action')
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'btn ghost toast-action'
+      b.textContent = action.label
+      b.addEventListener('click', () => {
+        dismiss()
+        action.run()
+      })
+      el.appendChild(b)
+    }
+    this.$('.toasts').appendChild(el)
+    timer = setTimeout(dismiss, ms)
   }
 
   // ── visibility ──────────────────────────────────────────────────────────────────────
@@ -880,15 +1186,23 @@ export class Hud {
     const panel = this.$('.settings')
     const open = force ?? panel.classList.contains('closed')
     panel.classList.toggle('closed', !open)
+    // Slid off the edge is not gone: without this its controls stay in the tab order.
+    panel.inert = !open
     this.$('#btn-settings').setAttribute('aria-pressed', String(open))
     // Both live in the same slot on the right; the sidebar steps aside rather than hides.
     this.$('.side').classList.toggle('shifted', open)
+  }
+
+  isSettingsOpen() {
+    return !this.$('.settings').classList.contains('closed')
   }
 
   toggleHelp(force) {
     const el = this.$('.help')
     const open = force ?? !el.classList.contains('open')
     el.classList.toggle('open', open)
+    // A sheet that covers the page has to take the keyboard with it.
+    if (open) this.$('#btn-help-close').focus()
   }
 
   /**
@@ -899,6 +1213,7 @@ export class Hud {
   toggleUi(force) {
     this.visible = force ?? !this.visible
     this.el.classList.toggle('hidden', !this.visible)
+    this.el.inert = !this.visible
     this.$('#btn-hide').innerHTML = this.visible ? ICON.eye : ICON.eyeOff
     this.actions.uiVisibility?.(this.visible)
     if (!this.visible) this.toggleHelp(false)
@@ -963,6 +1278,11 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
 }
 
+/** The status dot, with the status said for anyone who cannot see the colour. */
+function pipHtml(status) {
+  return `<i class="pip" role="img" aria-label="${escapeHtml(STATUS_LABEL[status] || status || 'Unknown')}"></i>`
+}
+
 /** Status → the colour family the top-bar counters already use for it. */
 function statusClass(status) {
   if (status === 'working') return 'working'
@@ -970,24 +1290,6 @@ function statusClass(status) {
   if (status === 'blocked') return 'blocked'
   if (status === 'celebrating') return 'done'
   return 'idle'
-}
-
-/**
- * A path that fits, trimmed from the *left* so the repo end survives — the deep end is the
- * part that identifies it. CSS can only ellipsise the tail, and `direction: rtl` mangles a
- * leading `~`, so the trim is done here and the whole path lives in the title attribute.
- */
-function shortPath(dir, max = 30) {
-  const home = dir.replace(/^\/Users\/[^/]+/, '~')
-  if (home.length <= max) return home
-  const parts = home.split('/')
-  let out = parts.pop() || ''
-  while (parts.length) {
-    const next = parts.pop()
-    if (out.length + next.length + 3 > max) break
-    out = `${next}/${out}`
-  }
-  return `…/${out}`
 }
 
 function shortModel(model) {
@@ -1046,7 +1348,7 @@ function ago(ts) {
 }
 
 const TEMPLATE = `
-<aside class="side panel">
+<aside class="side panel" aria-label="Zones and threads">
   <header class="brandbar">
     <div class="brand"><i class="dot"></i>BotsBay World</div>
     <button class="btn icon ghost" id="btn-shot" title="Screenshot (P)">${ICON.camera}</button>
@@ -1062,7 +1364,18 @@ const TEMPLATE = `
     <ul class="warns" hidden></ul>
   </div>
 
+  <div class="find" role="search">
+    <div class="find-row">
+      <input id="find-q" class="find-input" type="search" placeholder="Search threads  ( / )" aria-label="Search threads by title or project" autocomplete="off" spellcheck="false">
+      <button type="button" class="btn ghost" id="btn-find-clear" title="Clear search and filters (Esc)" aria-label="Clear search and filters" hidden>${ICON.close}</button>
+    </div>
+    <div class="chips find-chips source-chips" role="group" aria-label="Filter by source" hidden></div>
+    <div class="chips find-chips status-chips" role="group" aria-label="Filter by status"></div>
+    <div class="find-meta" aria-live="polite"></div>
+  </div>
+
   <div class="side-body">
+    <div class="results threads" aria-label="Search results"></div>
     <div class="projects-pane">
       <div class="sec-head"><span>Zones</span></div>
       <div class="projects"></div>
@@ -1071,6 +1384,12 @@ const TEMPLATE = `
           <span class="label">0 hidden</span>
         </button>
         <div class="hidden-projects" hidden></div>
+      </div>
+      <div class="archived-block" hidden>
+        <button type="button" class="hidden-toggle" id="btn-archived-toggle" aria-expanded="false">
+          <span class="label">Archived (0)</span>
+        </button>
+        <div class="archived-list hidden-projects" hidden></div>
       </div>
     </div>
 
@@ -1098,21 +1417,21 @@ const TEMPLATE = `
   </div>
 </aside>
 
-<div class="rail panel">
+<div class="rail panel" role="toolbar" aria-label="View controls">
   <button class="btn icon" id="btn-home" title="Reset the view (0)">${ICON.home}</button>
   <button class="btn icon" id="btn-next" title="Next builder waiting on you (N)">${ICON.next}</button>
   <div class="sep"></div>
   <button class="btn icon" id="btn-orbit" title="Orbit mode — sweep around the island (O)" aria-pressed="false">${ICON.orbit}</button>
-  <button class="btn icon" id="btn-planet" title="Change world (Tab)">${ICON.globe}</button>
+  <button class="btn icon" id="btn-planet" title="Change world (W)">${ICON.globe}</button>
   <button class="btn icon" id="btn-time" title="Change the time of day (L)">${ICON.sun}</button>
 </div>
 
-<div class="settings panel closed">
+<div class="settings panel closed" role="complementary" aria-label="Settings" inert>
   <header>Settings <button class="btn icon ghost" id="btn-close-settings" title="Close">${ICON.close}</button></header>
   <div class="body"></div>
 </div>
 
-<div class="thread-pop panel">
+<div class="thread-pop panel" role="region" aria-label="Selected thread">
   <i class="nib"></i>
   <div class="top">
     <div class="avatar"><canvas></canvas></div>
@@ -1123,6 +1442,7 @@ const TEMPLATE = `
     <button class="btn icon ghost" id="btn-deselect" title="Deselect (Esc)">${ICON.close}</button>
   </div>
   <div class="progress"><i></i></div>
+  <div class="detail" hidden></div>
   <div class="pair">
     <button class="btn primary" id="btn-open" title="Open this thread in the harness it came from (Enter)">${ICON.open} Open</button>
     <button class="btn" id="btn-viewed" title="Stop this thread asking for you until it moves on again (V)">${ICON.eye} Viewed</button>
@@ -1131,11 +1451,11 @@ const TEMPLATE = `
   </div>
 </div>
 
-<div class="toasts"></div>
+<div class="toasts" role="status" aria-live="polite"></div>
 <div class="fps panel"></div>
-<div class="hint-pill panel"></div>
+<div class="hint-pill panel" role="status" aria-live="polite"></div>
 
-<div class="help">
+<div class="help" role="dialog" aria-modal="true" aria-label="Help">
   <div class="sheet panel">
     <h2>BotsBay World</h2>
     <p class="sub">Every agent working for BotsBay is a builder on this island. They come off the boat, claim a plot for their project, and build. Click one to open its thread; click a zone — its deck or its name — for the project itself, and start a new conversation there. Hide a project from that panel if you would rather not see it — its threads stay in your harness, and you can show it again from the list. Navigation works like Google Earth — drag the ground itself, right-drag to tilt, scroll to zoom in on whatever is under the cursor.</p>
@@ -1150,27 +1470,36 @@ const TEMPLATE = `
         <div class="k"><span>Hide all UI</span><kbd>H</kbd> <kbd>${IS_MAC ? '⌘' : 'Ctrl'}\\</kbd></div>
         <div class="k"><span>Settings</span><kbd>S</kbd></div>
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
+        <div class="k"><span>Search threads</span><kbd>/</kbd></div>
       </div>
       <div>
         <div class="k"><span>Next needing you</span><kbd>N</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
         <div class="k"><span>Archive</span><kbd>A</kbd></div>
+        <div class="k"><span>Undo archive</span><kbd>U</kbd></div>
         <div class="k"><span>New conversation</span><kbd>C</kbd></div>
         <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
         <div class="k"><span>Retry a failed run</span><kbd>R</kbd></div>
-        <div class="k"><span>Change world</span><kbd>Tab</kbd></div>
+        <div class="k"><span>Change world</span><kbd>W</kbd></div>
         <div class="k"><span>Time of day</span><kbd>L</kbd></div>
-        <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>
+        <div class="k"><span>Back out, close, clear</span><kbd>Esc</kbd></div>
         <div class="k"><span>This sheet</span><kbd>?</kbd></div>
       </div>
     </div>
     <div style="margin-top:16px">
       <div class="legend-row"><i class="badge" style="background:#1a2b46;color:#8fb4ee">?</i> waiting on your reply — click to open the thread</div>
-      <div class="legend-row"><i class="badge" style="background:#3d1c1c;color:#e88b8b">!</i> the session hit an error</div>
+      <div class="legend-row"><i class="badge" style="background:#3d1c1c;color:#e88b8b">!</i> the session or workflow run hit an error</div>
       <div class="legend-row"><i class="badge" style="background:#16301f;color:#7fd39a">⚒</i> running right now, building</div>
-      <div class="legend-row"><i class="badge" style="background:#332b12;color:#e6c67f">✓</i> its pull request landed</div>
-      <div class="legend-row"><i class="badge" style="background:#1d1f2e;color:#a9a8c0">z</i> nothing for three days</div>
+      <div class="legend-row"><i class="badge" style="background:#332b12;color:#e6c67f">✓</i> its pull request landed, or its last run succeeded</div>
+      <div class="legend-row"><i class="badge none" style="color:#b6b5be">·</i> <span><b>idle</b> — no badge. Awake, standing about its plot, now and then visiting a neighbour</span></div>
+      <div class="legend-row"><i class="badge none" style="color:#7c7b86">·</i> <span><b>asleep</b> — no badge. Nothing for three days: it sits on the floor with its eyes shut. Settings hides these from the map by default; search still finds them</span></div>
+      <div class="legend-row legend-pips">
+        <span class="pips" aria-hidden="true">
+          <i style="color:#7fd39a"></i><i style="color:#8fb4ee"></i><i style="color:#e88b8b"></i><i style="color:#e6c67f"></i><i style="color:#b6b5be"></i>
+        </span>
+        <span>counters and list dots: <span style="color:#7fd39a">building</span>, <span style="color:#8fb4ee">need you</span>, <span style="color:#e88b8b">blocked</span>, <span style="color:#e6c67f">shipped</span>, <span style="color:#b6b5be">builders / idle</span></span>
+      </div>
     </div>
     <div style="margin-top:18px;display:flex;justify-content:flex-end">
       <button class="btn primary" id="btn-help-close">Got it</button>

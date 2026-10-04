@@ -184,6 +184,8 @@ const SHADOW_EXTENT = 30
 const MOON_DIR = new THREE.Vector3(-0.55, 0.5, -0.66).normalize()
 /** Moonlight for a world that does not name its own: cool, and about a fifth of a sun. */
 const DEFAULT_MOONLIGHT = { color: 0x9fb3d9, intensity: 0.45 }
+/** What a world that says nothing about its night keeps: the old third of the day's hemisphere. */
+const DEFAULT_NIGHT_FILL = { hemi: 0.3, env: 1 }
 /**
  * The focus is snapped to this grid before the shadow camera moves. Panning a shadow map
  * by sub-texel amounts makes every shadow edge crawl; snapping trades a little slack at
@@ -245,6 +247,17 @@ export class Sky {
     this._envDirty = true
     this._envAt = 0
     this._envTarget = null
+    // A lost context empties the prefiltered map and the generator's own scratch targets.
+    // The engine cannot reach in here, so the sky listens for the same event it does and
+    // starts over: a fresh generator, and the environment drawn again on the next frame.
+    // Without it every metal and every dielectric lost its sky and the island went flat.
+    this.renderer.domElement.addEventListener('webglcontextrestored', () => {
+      this.pmrem.dispose()
+      this.pmrem = new THREE.PMREMGenerator(this.renderer)
+      this._envTarget = null
+      this._envDirty = true
+      this._envAt = 0
+    })
   }
 
   _refreshEnvironment(force = false) {
@@ -266,7 +279,7 @@ export class Sky {
     this._envTarget?.dispose()
     this._envTarget = next
     this.scene.environment = next.texture
-    this.scene.environmentIntensity = this.settings.get('iblIntensity')
+    this.scene.environmentIntensity = this.settings.get('iblIntensity') * (this._nightEnv ?? 1)
   }
 
   _buildDome() {
@@ -554,7 +567,13 @@ export class Sky {
     // The hemisphere light drops right back when IBL is carrying the ambient — running both
     // at full strength double-counts the sky and flattens everything out.
     const hemiScale = this.settings.get('ibl') ? 0.55 : 1
-    this.hemi.intensity = THREE.MathUtils.lerp(planet.ambient.intensity * 0.3, planet.ambient.intensity, day) * hemiScale
+    const fill = planet.nightFill || DEFAULT_NIGHT_FILL
+    this.hemi.intensity = THREE.MathUtils.lerp(planet.ambient.intensity * fill.hemi, planet.ambient.intensity, day) * hemiScale
+    // The sky reflections are dim after dark by construction — the night dome is a few
+    // percent of the day's — so a world that wants a readable night lifts them here, fading
+    // back to the setting's own value as the sun comes up.
+    this._nightEnv = THREE.MathUtils.lerp(fill.env, 1, day)
+    this.scene.environmentIntensity = this.settings.get('iblIntensity') * this._nightEnv
 
     // Sky gradient.
     const top = this._c1.copy(this.nightTop).lerp(this.dayTop, day)
@@ -598,7 +617,7 @@ export class Sky {
     if (changed.has('clockTime')) this._clockAt = 0
     if (changed.has('stars')) this.setTime(this.time)
     if (changed.has('ibl') || changed.has('iblIntensity')) {
-      this.scene.environmentIntensity = this.settings.get('iblIntensity')
+      this.scene.environmentIntensity = this.settings.get('iblIntensity') * (this._nightEnv ?? 1)
       this._refreshEnvironment(true)
     }
   }

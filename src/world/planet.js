@@ -21,6 +21,8 @@ import { atlasTexture, hasPart, part } from './kit.js'
  *   `weather`      — what drifts through the air: `sand`, `dust` or `pollen`; `dust` is how much
  *   `wind`         — which way the sand goes, as a unit-ish direction on the ground
  *   `moonlight`    — the key light after dark, colour and intensity
+ *   `nightFill`    — how much ambient survives after dark: `hemi` is a share of the day's
+ *                    hemisphere light (0.3 if unsaid), `env` multiplies the sky reflections (1)
  *   `farDarken`    — how hard the far ground is dimmed toward the horizon (0.75 if unsaid)
  */
 
@@ -51,7 +53,10 @@ export const PLANETS = {
     // sky fill is what the eye reads as sunlight, and the environment map supplies the cool.
     sun: { color: 0xffe3bc, intensity: 2.4, night: 0.11 },
     // After dark the key is the moon — cool, and enough to give the night its own shadows.
-    moonlight: { color: 0x9fb4dc, intensity: 0.34 },
+    moonlight: { color: 0x9fb4dc, intensity: 1.0 },
+    // A third of a day's ambient was black: the deck, the walls and the builders were all
+    // lit by nothing but a 0.34 moon. Indigo night, but one you can read the island in.
+    nightFill: { hemi: 0.62, env: 2.0 },
     ambient: { sky: 0xa6d3e6, ground: 0x94805a, intensity: 1.0 },
     atmosphere: 1,
     craters: 0,
@@ -69,15 +74,21 @@ export const PLANETS = {
     /**
      * Zone colours, re-rooted on pearl white. Overrides `PLOT_PALETTE` for this world only.
      *
-     * Pearl is a narrow band to pick twelve distinguishable colours out of, so these spread
+     * Pearl is a narrow band to pick distinguishable colours out of, so these spread
      * across *value* as well as hue — pearl down through champagne and greige to oyster —
-     * rather than being twelve tints of the same lightness, which would be a dozen zones
-     * nobody could tell apart. Measured, the closest pair here is ΔE 9.0; the closest pair
-     * in `PLOT_PALETTE` is ΔE 1.0, so this is the more separable of the two.
+     * rather than being tints of the same lightness, which would be zones nobody could tell
+     * apart. Measured, the closest pair here is ΔE 9.0; the closest pair in `PLOT_PALETTE`
+     * is ΔE 1.0, so this is the more separable of the two.
+     *
+     * Twenty-four of them: seventeen zones had run twelve out, and the second dozen (pastel
+     * rose, mint, lilac, sky, butter and their neighbours) were found by farthest-point
+     * search against the first, so the closest pair did not move by adding them.
      */
     palette: [
       0xf2ede3, 0xe6d9bc, 0xd4e2df, 0xf0dbd0, 0xdcd6c6, 0xdde4f2,
       0xf3e9cc, 0xd7e2d2, 0xecd8e0, 0xc6d2d6, 0xe6e0f0, 0xd8cbb4,
+      0xe4b6e4, 0xb6e4b6, 0xb6bfe4, 0xe4b6b6, 0xe4b6ce, 0xb6e4ce,
+      0xdde4b6, 0xd2c2da, 0xb6cee4, 0xf2f7fa, 0xdac2c2, 0xb6e4e4,
     ],
     sea: {
       /**

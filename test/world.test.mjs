@@ -167,6 +167,8 @@ test('nothing is planted in the sea, and the planting is sparse', () => {
 test('Bahrain paints its zones pearl, and the tones stay tellable apart', () => {
   const palette = PLANETS.bahrain.palette
   assert.equal(palette.length, PLOT_PALETTE.length, 'as many zone colours as the default')
+  assert.ok(palette.length >= 24, 'enough zone colours for a real roster')
+  assert.equal(new Set(palette).size, palette.length, 'no colour listed twice')
   const hsl = {}
   for (const accent of palette) {
     new THREE.Color(accent).getHSL(hsl)

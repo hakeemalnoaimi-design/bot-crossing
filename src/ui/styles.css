@@ -5,14 +5,23 @@
 
 :root {
   --bg: #0a0b0f;
-  --panel: rgba(16, 17, 22, 0.82);
+  /* 0.88, up from 0.82: over pale sand the panel was letting enough light through to pull
+     small grey text under 4.5:1. */
+  --panel: rgba(16, 17, 22, 0.88);
   --panel-solid: #14151b;
   --line: rgba(255, 255, 255, 0.09);
   --line-strong: rgba(255, 255, 255, 0.16);
   --text: #f2f0ec;
   --muted: #9b9aa3;
-  --dim: #6f6e78;
+  /* Small secondary text. Was #6f6e78, which is 3.6:1 on the panel; this is 5.5:1 on the solid
+     panel and 4.7:1 over the palest ground the panel is drawn on. */
+  --dim: #8d8c96;
   --accent: #c96442;
+  /* The accent as a button fill. White on #c96442 is 3.9:1; these are 4.95:1 and 5.6:1. */
+  --accent-btn: #b5532f;
+  --accent-btn-hover: #a84d2b;
+  /* The keyboard focus ring: light enough to be seen on the panel and on the pressed chips. */
+  --focus: #ffb193;
   --green: #4f9a63;
   --blue: #4f7ec9;
   --amber: #c9a24f;
@@ -137,14 +146,14 @@ body {
 }
 
 .btn.primary {
-  background: var(--accent);
+  background: var(--accent-btn);
   border-color: transparent;
   color: #fff;
   font-weight: 600;
 }
 
 .btn.primary:hover {
-  background: #d97553;
+  background: var(--accent-btn-hover);
 }
 
 .btn.ghost {
@@ -729,7 +738,7 @@ body {
 }
 
 .stat[data-empty='true'] {
-  opacity: 0.4;
+  opacity: 0.6;
 }
 
 .stat .pip {
@@ -1224,6 +1233,9 @@ body {
 
 .help .sheet {
   width: min(560px, calc(100vw - 40px));
+  /* The legend grew past a short window; the sheet scrolls rather than losing its top. */
+  max-height: calc(100vh - 28px);
+  overflow-y: auto;
   padding: 22px 24px;
 }
 
@@ -1505,7 +1517,7 @@ kbd {
 
 .side .thread.asleep {
   grid-template-columns: auto 1fr auto auto;
-  opacity: 0.55;
+  opacity: 0.78;
   color: #7c7b86;
 }
 
@@ -1519,4 +1531,270 @@ kbd {
   border: 1px solid var(--line-strong);
   border-radius: 6px;
   padding: 1px 6px;
+}
+
+/* ── keyboard focus ──────────────────────────────────────────────────────────────── */
+
+/* Every control in the HUD, and one ring for all of them. Rows in a scrolling list draw it
+   inside, because the list clips whatever is outside its edge. */
+.hud :is(button, select, input, [role='switch']):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.side :is(.repo, .thread, .stat, .chip, .asleep-toggle, .hidden-toggle, .show-repo, .btn):focus-visible,
+.thread-pop .btn:focus-visible {
+  outline-offset: -2px;
+}
+
+/* ── search and filter ───────────────────────────────────────────────────────────── */
+
+.side .find {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 15px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.side .find-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.side .find-input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  user-select: text;
+  pointer-events: auto;
+}
+
+.side .find-input::placeholder {
+  color: var(--dim);
+}
+
+.side .find-input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.side .find-row .btn {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+}
+
+.side .find-row .btn[hidden] {
+  display: none;
+}
+
+.side .find .chips {
+  gap: 4px;
+}
+
+.side .find .chips[hidden] {
+  display: none;
+}
+
+.side .find .chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
+}
+
+.side .find .chip .c {
+  font-variant-numeric: tabular-nums;
+  color: var(--dim);
+  font-size: 10.5px;
+}
+
+.side .find .chip[aria-pressed='true'] .c {
+  color: inherit;
+  opacity: 0.8;
+}
+
+.side .find .status-chips .chip::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #b6b5be;
+  flex: none;
+}
+
+.side .find .status-chips .chip.working::before {
+  background: #7fd39a;
+}
+.side .find .status-chips .chip.waiting::before {
+  background: #8fb4ee;
+}
+.side .find .status-chips .chip.blocked::before {
+  background: #e88b8b;
+}
+.side .find .status-chips .chip.done::before {
+  background: #e6c67f;
+}
+
+.side .find-meta {
+  min-height: 0;
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.side .find-meta:empty {
+  display: none;
+}
+
+/* While a search is on, its results stand in for both panes. */
+.side .results {
+  display: none;
+}
+
+.side.searching .results {
+  display: flex;
+}
+
+.side.searching .projects-pane,
+.side.searching .project-detail,
+.side.searching.drilled .project-detail {
+  display: none;
+}
+
+.side .results .empty {
+  padding: 14px 10px;
+  font-size: 12px;
+  color: var(--dim);
+  line-height: 1.4;
+}
+
+.side .thread.nodraw {
+  grid-template-columns: auto 1fr auto auto;
+}
+
+.side .thread.nodraw .open {
+  font-size: 10.5px;
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+
+/* ── archived list ───────────────────────────────────────────────────────────────── */
+
+.side .archived-block {
+  flex: none;
+  border-top: 1px solid var(--line);
+}
+
+.side .archived-block[hidden] {
+  display: none;
+}
+
+.side .archived-list {
+  max-height: 180px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.side .archived-list[hidden] {
+  display: none;
+}
+
+/* ── the thread card, for a workflow ─────────────────────────────────────────────── */
+
+.thread-pop .tag.wf.on {
+  color: #7fd39a;
+}
+
+.thread-pop .tag.wf.off {
+  color: var(--muted);
+}
+
+.thread-pop .detail {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.thread-pop .detail[hidden] {
+  display: none;
+}
+
+.thread-pop .detail .err {
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(201, 79, 79, 0.14);
+  border: 1px solid rgba(201, 79, 79, 0.35);
+  color: #ffb4b4;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.thread-pop .detail code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+  user-select: text;
+}
+
+/* ── toast with a button ─────────────────────────────────────────────────────────── */
+
+.toast.has-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toast .toast-action {
+  height: 26px;
+  min-width: 0;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--focus);
+  flex: none;
+}
+
+/* ── help legend ─────────────────────────────────────────────────────────────────── */
+
+.help .legend-row b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.help .legend-row .badge.none {
+  background: transparent;
+  border: 1px dashed var(--line-strong);
+}
+
+.help .legend-pips .pips {
+  display: flex;
+  gap: 3px;
+  width: 20px;
+  flex-wrap: wrap;
+  flex: none;
+}
+
+.help .legend-pips .pips i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
 }

@@ -171,7 +171,19 @@ const DEFAULTS = {
   autoFrame: false, // ease the camera back to isometric when you stop dragging; opt-in
   showFps: false,
   showLabels: true,
+  /** Follows the operating system's own setting until it is changed here — see `reducedMotion` below. */
   reducedMotion: false,
+  /** True once somebody has touched the Reduced motion toggle. After that the OS no longer gets a say. */
+  reducedMotionChosen: false,
+}
+
+/** What the OS says about motion, or false anywhere there is no `matchMedia` to ask. */
+function systemReducedMotion() {
+  try {
+    return Boolean(globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches)
+  } catch {
+    return false
+  }
 }
 
 /** Keys whose change forces a full rebuild of the world (terrain, scatter, sky). */
@@ -194,6 +206,21 @@ export class Settings {
     this.values = { ...DEFAULTS, ...load() }
     this.listeners = new Set()
     this._saveTimer = 0
+    // The whole value set is saved, so a stored `reducedMotion: false` is as likely to be the
+    // default as a choice. Only an explicit touch of the toggle marks it as one; until then the
+    // OS answers, and keeps answering if somebody flips it while the page is open.
+    if (!this.values.reducedMotionChosen) {
+      this.values.reducedMotion = systemReducedMotion()
+      try {
+        globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').addEventListener?.('change', () => {
+          if (this.values.reducedMotionChosen) return
+          this.values.reducedMotion = systemReducedMotion()
+          this._emit(['reducedMotion'])
+        })
+      } catch {
+        /* no matchMedia — the default stands */
+      }
+    }
   }
 
   get(key) {
@@ -209,6 +236,7 @@ export class Settings {
   set(key, value) {
     if (this.values[key] === value) return
     this.values[key] = value
+    if (key === 'reducedMotion') this.values.reducedMotionChosen = true
     // Touching any quality knob directly means you are no longer on a named preset.
     const preset = PRESETS[this.values.preset]
     if (preset && key in preset.values) this.values.preset = 'custom'
@@ -264,6 +292,9 @@ export class Settings {
     const changed = []
     for (const [key, value] of Object.entries(values || {})) {
       if (!(key in this.values) || this.values[key] === value) continue
+      // The colony file's copy of this is another browser's choice (or its OS default), so it
+      // only counts when somebody made it on purpose.
+      if (key === 'reducedMotion' && !values.reducedMotionChosen) continue
       this.values[key] = value
       changed.push(key)
     }

@@ -124,6 +124,14 @@ export class Engine {
     /** How far the view is orbiting; the focal plane sits here. Fed by the frame loop. */
     this._focusDistance = 30
 
+    /** True from `webglcontextlost` until the browser hands the context back. */
+    this.contextLost = false
+    this._overlay = null
+    this._onContextLost = (e) => this._contextLost(e)
+    this._onContextRestored = () => this._contextRestored()
+    this.canvas.addEventListener('webglcontextlost', this._onContextLost)
+    this.canvas.addEventListener('webglcontextrestored', this._onContextRestored)
+
     this.perf = new PerfMonitor()
     this._boundLoop = this._loop.bind(this)
     this._onResize = () => this.resize()
@@ -404,6 +412,103 @@ export class Engine {
     return this.settings.get('renderScale') * (window.devicePixelRatio || 1)
   }
 
+  /**
+   * The GPU took the context away — a driver reset, a TDR on an integrated part under load,
+   * the browser reclaiming it from a background tab. Left alone the canvas stays black for as
+   * long as the page is open, because a context is only ever given back to a page that said
+   * it wants one: `preventDefault` is that request, and without it `webglcontextrestored`
+   * never fires at all.
+   *
+   * The loop stops rather than drawing into a dead context (every call is a silent no-op,
+   * and the governor would read the resulting thousand-fps frames as a machine with room to
+   * spare). The simulation stops with it, which is fine: nothing here is real-time.
+   *
+   * Announced on `window` as `botsbay:graphics` with `detail.state` of `lost`, `restored` or
+   * `failed`, for anything that wants to say so; the overlay below is this file's own.
+   */
+  _contextLost(e) {
+    e.preventDefault()
+    if (this.contextLost) return
+    this.contextLost = true
+    this._wasRunning = this.running
+    this.renderer.setAnimationLoop(null)
+    this._showOverlay(false)
+    // A context that is not coming back is worth saying so about, rather than a spinner.
+    clearTimeout(this._giveUp)
+    this._giveUp = setTimeout(() => {
+      if (this.contextLost) this._showOverlay(true)
+    }, 6000)
+    window.dispatchEvent(new CustomEvent('botsbay:graphics', { detail: { state: 'lost' } }))
+  }
+
+  /**
+   * Three re-initialises its own state on restore (programs, buffers and textures are all
+   * uploaded again on first use), but three things it cannot know about are empty: the sky's
+   * prefiltered environment and the shadow map are render targets that held a picture, and
+   * the post chain's targets and their depth texture were sized against the old context.
+   * The chain is rebuilt from scratch — cheap, and the one way to be certain. The sky listens
+   * for the same event and redraws its environment; anything on the updater list that keeps
+   * GPU-side state of its own is told through `onContextRestored`.
+   */
+  _contextRestored() {
+    if (!this.contextLost) return
+    clearTimeout(this._giveUp)
+    try {
+      this._disposeComposer()
+      this._sizedAt = null
+      this._shadowSize = null
+      this.applySettings()
+      for (const u of this.updaters) u.onContextRestored?.()
+      this.contextLost = false
+      this._hideOverlay()
+      if (this._wasRunning) {
+        this.timer.reset()
+        this.renderer.setAnimationLoop(this._boundLoop)
+      }
+      window.dispatchEvent(new CustomEvent('botsbay:graphics', { detail: { state: 'restored' } }))
+    } catch (err) {
+      // Restored, but not into anything we can draw with: offer the reload that will.
+      console.error('Could not rebuild after a context loss', err)
+      this._showOverlay(true)
+      window.dispatchEvent(new CustomEvent('botsbay:graphics', { detail: { state: 'failed' } }))
+    }
+  }
+
+  /** A small self-contained notice. Built on first use, so a healthy session never has it. */
+  _showOverlay(offerReload) {
+    if (!this._overlay) {
+      const box = document.createElement('div')
+      box.setAttribute('role', 'status')
+      box.setAttribute('aria-live', 'polite')
+      box.style.cssText =
+        'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483000;' +
+        'padding:14px 20px;border-radius:12px;background:rgba(14,18,34,0.92);color:#e8ecf8;' +
+        'font:500 14px/1.4 system-ui,sans-serif;text-align:center;' +
+        'box-shadow:0 8px 32px rgba(0,0,0,0.45);border:1px solid rgba(160,180,230,0.25)'
+      const text = document.createElement('div')
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.textContent = 'Reload'
+      button.style.cssText =
+        'display:none;margin-top:10px;padding:6px 16px;border-radius:8px;cursor:pointer;' +
+        'border:1px solid rgba(160,180,230,0.4);background:#2a3560;color:inherit;font:inherit'
+      button.addEventListener('click', () => location.reload())
+      box.append(text, button)
+      document.body.appendChild(box)
+      this._overlay = { box, text, button }
+    }
+    const { box, text, button } = this._overlay
+    box.style.display = ''
+    text.textContent = offerReload
+      ? 'Graphics could not be restored. Reload to carry on.'
+      : 'Graphics were reset — restoring…'
+    button.style.display = offerReload ? 'inline-block' : 'none'
+  }
+
+  _hideOverlay() {
+    if (this._overlay) this._overlay.box.style.display = 'none'
+  }
+
   start() {
     if (this.running) return
     this.running = true
@@ -417,6 +522,7 @@ export class Engine {
   }
 
   _loop() {
+    if (this.contextLost) return
     this.timer.update()
     // The timer already zeroes the delta across a hidden tab; the clamp is the backstop for
     // an ordinary long frame, so one stalled frame never jumps the whole colony forward.
@@ -443,6 +549,7 @@ export class Engine {
    * is `preserveDrawingBuffer`, which costs a full copy on every frame forever.
    */
   renderFrame() {
+    if (this.contextLost) return
     this.renderer.info.reset()
     if (this.composer && (this.settings.get('bloom') || this.settings.get('antialias') || this.settings.get('tiltShift'))) {
       this._syncDepthTexture()
@@ -513,6 +620,10 @@ export class Engine {
     window.removeEventListener('resize', this._onResize)
     this._dprQuery?.removeEventListener?.('change', this._onResize)
     this._observer?.disconnect()
+    clearTimeout(this._giveUp)
+    this.canvas.removeEventListener('webglcontextlost', this._onContextLost)
+    this.canvas.removeEventListener('webglcontextrestored', this._onContextRestored)
+    this._overlay?.box.remove()
     document.removeEventListener('visibilitychange', this._onWake)
     window.removeEventListener('focus', this._onWake)
     window.removeEventListener('pageshow', this._onWake)

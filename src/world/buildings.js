@@ -278,6 +278,7 @@ function decorate(material, uniforms) {
          varying float vEmissive;
          varying vec2 vAtlasUv;
          varying float vLocalY;
+         varying vec2 vLocalXZ;
          uniform float uProgress;
          uniform float uMaxY;
          uniform float uMinY;
@@ -308,6 +309,7 @@ function decorate(material, uniforms) {
          // Measured *after* the rotor has turned, so a blade sweeping past the ground line
          // is revealed and hidden by the same rule as everything else.
          vLocalY = transformed.y;
+         vLocalXZ = transformed.xz;
          // The whole structure is lowered into the ground, and the fragment stage throws
          // away whatever ends up below the deck. What is on screen is therefore always a
          // *complete* building, part of it buried — never a sliced one.
@@ -321,6 +323,7 @@ function decorate(material, uniforms) {
          varying float vEmissive;
          varying vec2 vAtlasUv;
          varying float vLocalY;
+         varying vec2 vLocalXZ;
          uniform float uProgress;
          uniform float uMaxY;
          uniform float uMinY;
@@ -361,7 +364,7 @@ function decorate(material, uniforms) {
          float accentAmount = uCellAccent[ cell ];
          if ( accentAmount > 0.0 ) {
            float lum = dot( diffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
-           diffuseColor.rgb = mix( diffuseColor.rgb, uAccent * clamp( lum * 1.9, 0.3, 1.5 ), accentAmount );
+           diffuseColor.rgb = mix( diffuseColor.rgb, uAccent * clamp( lum * 1.9, 0.3, 1.1 ), accentAmount );
          }
          diffuseColor.rgb *= footAO;`
       )
@@ -373,11 +376,20 @@ function decorate(material, uniforms) {
         `#include <emissivemap_fragment>
          // Lamps and beacons, flagged per vertex when the recipe placed them.
          totalEmissiveRadiance += diffuseColor.rgb * vEmissive * ( 0.25 + uLit * 2.4 );
-         // Window strips and trim come on in the evening — at this building's own moment,
-         // see \`lightsAt\` — in the repo's colour pulled toward lamplight. A pearl-white
-         // accent lit at full strength was a white blaze the bloom pass turned into a blob;
-         // amber through a pale tint is what a lit window actually looks like from outside.
-         totalEmissiveRadiance += mix( uAccent, vec3( 1.0, 0.76, 0.46 ), 0.6 ) * uCellAccent[ cell ] * uLit * 0.75;
+         // Window strips come on in the evening — at this building's own moment, see
+         // \`lightsAt\` — in the repo's colour pulled toward lamplight.
+         //
+         // The accent swatch is not a window. On the kit it is a whole wall band, and on a
+         // dome most of the visible surface, so adding emission to every fragment of it lit
+         // each band as one flat, unshaded, hard-edged slab: at night the pearl accent read as
+         // clipped cream with no form left in it, whatever the exposure. A window is a short
+         // lit pane with dark wall between it and the next, so the emission is broken into
+         // panes along the wall (the two weights are off the octagon's 45-degree edges, so no
+         // face is left with a constant phase) and the rest of the band keeps its shading.
+         float along = fract( vLocalXZ.x * 4.1 + vLocalXZ.y * 2.6 );
+         float pane = smoothstep( 0.34, 0.40, along ) * ( 1.0 - smoothstep( 0.52, 0.58, along ) );
+         vec3 lampTint = mix( uAccent, vec3( 1.0, 0.76, 0.46 ), 0.6 );
+         totalEmissiveRadiance += lampTint * uCellAccent[ cell ] * uLit * ( 0.03 + 0.9 * pane );
          // The construction line: a bright band riding just above the ground it rises from.
          float band = 1.0 - smoothstep( 0.0, 0.22, vLocalY - ground );
          totalEmissiveRadiance += uAccent * band * ( 1.0 - step( 0.999, uProgress ) ) * 1.5;`
