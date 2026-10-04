@@ -850,6 +850,9 @@ async function poll({ force = false } = {}) {
       scannedAt: Number(res.scannedAt) || Date.now(),
       stale: (res.threads || []).some((t) => t.staleSince),
     })
+    // The first roster is when the real work starts — every builder walking off the boat at
+    // once — so that is when the quality governor's grace period should start, not at mount.
+    if (document.querySelector('.boot')) engine.warmUp()
     hud.removeBoot()
   } catch (err) {
     // Stays on screen, unlike the toast: the old picture is still up, and what it needs is a

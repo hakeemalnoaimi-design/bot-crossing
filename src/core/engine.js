@@ -31,11 +31,34 @@ const BLOOM_SCALE = 0.7
  * climbs. Everything between is where it holds still. The old floor was 45, which meant a
  * machine could sit at fifty frames a second for as long as the window was open and the
  * governor would call that settled — on a sixty-hertz panel that is a doubled frame every
- * few, which reads as a stutter rather than as slowness. The floor is now just under the
- * panel's own rate, so what the governor settles on is a scale that actually holds it.
+ * few, which reads as a stutter rather than as slowness.
+ *
+ * It was then raised to 55, and on the Intel UHD 630 with a live roster that put the frame
+ * rate right on the line: every wobble read as slow, and the governor walked the picture
+ * down to 35% — mush — chasing frames an ambient map does not need. 50 is the compromise:
+ * a few dropped frames on a sixty-hertz panel, against a picture that can be read. The
+ * resolution floor (`MIN_SCALE`) is the other half of that bargain.
  */
-const SLOW_FPS = 55
+const SLOW_FPS = 50
 const FAST_FPS = 58
+
+/** Lowest share of the display's resolution the governor will go to. Below this, text is gone. */
+const MIN_SCALE = 0.6
+
+/**
+ * Seconds after starting, waking or resizing during which the governor only watches. Those
+ * frames are shader compiles and a boat-load of builders arriving, not the steady state, and
+ * reading them as a slow machine is what dropped a fresh page three steps in its first five
+ * seconds and then spent a minute climbing back.
+ */
+const WARMUP_MS = 8000
+
+/**
+ * How long a scale that proved too slow stays off limits. Without this the governor climbs
+ * back to it after its cooldown, fails, drops, and does it again for as long as the page is
+ * open — every round a visible sharpen and blur.
+ */
+const TOO_SLOW_MS = 10 * 60 * 1000
 
 /**
  * Renderer, post chain, and the frame loop.
@@ -159,6 +182,7 @@ export class Engine {
       if (document.hidden || !this.running) return
       this.resize()
       this.renderFrame()
+      this.warmUp()
     }
     document.addEventListener('visibilitychange', this._onWake)
     window.addEventListener('focus', this._onWake)
@@ -379,7 +403,16 @@ export class Engine {
     this._slow = 0
     this._fast = 0
     this._climbAt = 0
+    this._tooSlow = null
     this.autoScaled = false
+    this.warmUp()
+  }
+
+  /** Watch, do not act, for a few seconds: what follows a start or a wake is not the steady state. */
+  warmUp() {
+    this._warmUntil = performance.now() + WARMUP_MS
+    this._slow = 0
+    this._fast = 0
   }
 
   /**
@@ -513,6 +546,7 @@ export class Engine {
     if (this.running) return
     this.running = true
     this.timer.reset()
+    this.warmUp()
     this.renderer.setAnimationLoop(this._boundLoop)
   }
 
@@ -574,6 +608,7 @@ export class Engine {
     if (now - (this._lastGovern || 0) < 1000) return
     this._lastGovern = now
 
+    if (now < (this._warmUntil || 0)) return
     const fps = this.perf.fps
     if (fps <= 0) return
     const ceiling = this._targetScale()
@@ -581,22 +616,30 @@ export class Engine {
     // The floor is half the display's own resolution, not half a CSS pixel: on a retina
     // panel the old absolute 0.5 was a quarter-resolution buffer, which reads as broken
     // rather than as a machine having a hard time.
-    const floor = 0.35 * (window.devicePixelRatio || 1)
+    const floor = Math.min(ceiling, MIN_SCALE * (window.devicePixelRatio || 1))
 
     // Sustained evidence, not one sample: 3 slow seconds to drop, 8 fast ones to climb.
     this._slow = fps < SLOW_FPS ? (this._slow || 0) + 1 : 0
     this._fast = fps > FAST_FPS ? (this._fast || 0) + 1 : 0
     const dpr = window.devicePixelRatio || 1
 
+    // Climbing stops short of the last scale that could not hold the frame rate.
+    if (this._tooSlow && now >= this._tooSlow.until) this._tooSlow = null
+    const cap = this._tooSlow ? Math.min(ceiling, this._tooSlow.scale - 0.05 * dpr) : ceiling
+
     let next = current
     if (this._slow >= 3) {
-      next = Math.max(floor, current - 0.15 * dpr)
+      // Far below the line, go straight to where it should land rather than a step at a time:
+      // pixel cost goes with the square of the scale, so the square root of the shortfall is
+      // the estimate. Three visible resolution changes in a row read worse than one.
+      next = Math.max(floor, Math.min(current - 0.15 * dpr, current * Math.sqrt(fps / FAST_FPS)))
       this._slow = 0
       // Having just proved this machine cannot hold the higher scale, do not go back and
       // ask it again ten seconds later — that is the oscillation.
       this._climbAt = now + 30000
-    } else if (this._fast >= 8 && current < ceiling && now >= (this._climbAt || 0)) {
-      next = Math.min(ceiling, current + 0.1 * dpr)
+      this._tooSlow = { scale: current, until: now + TOO_SLOW_MS }
+    } else if (this._fast >= 8 && current < cap - 0.01 && now >= (this._climbAt || 0)) {
+      next = Math.min(cap, current + 0.1 * dpr)
       this._fast = 0
     }
 
