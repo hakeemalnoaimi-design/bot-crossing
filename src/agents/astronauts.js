@@ -2,15 +2,22 @@ import * as THREE from 'three'
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js'
 import { buildFaceAtlas, FACE, FACE_LOOPS, FRAME_COLS, FRAME_ROWS } from './faces.js'
 import { attachMatrixAt, decorateSkinned, frameFor } from './crew.js'
+import { capRoster } from '../game/roster.js'
 
 /**
- * Every astronaut in the colony, drawn in seven draw calls.
+ * Every astronaut in the colony, drawn in a dozen instanced draws.
  *
  * The body is one instanced, GPU-skinned mesh playing KayKit's hand-animated clips (see
  * `crew.js`) — every torso, arm and leg in the colony in a single draw, whether there are
  * six threads or three hundred. Everything the crew *wears* stays procedural and stays in
  * its own `InstancedMesh`: helmet, visor, screen-face, backpack, antenna and lamp, because
  * those carry the colony's own identity and its own shaders.
+ *
+ * The body and the three parts on the head exist twice: a fine set for builders near the
+ * camera and a coarse one for everybody else — see `LOD_NEAR`. Same materials, same bone
+ * table, same shaders; only the triangle count differs, and it differs by a factor of
+ * five, which on an integrated GPU was the difference between the crowd being the most
+ * expensive thing in the frame and being one of the cheapest.
  *
  * Worn parts are pinned to bones the cheap way. The baked animation lives in an ordinary
  * array as well as in the texture the shader samples, so placing a helmet is one matrix
@@ -82,6 +89,46 @@ const DRIFT_PACE = 0.55
 const ARRIVE_RADIUS = SEPARATION + 0.45
 /** Paths computed per frame. Re-routing the whole crew takes a few frames, unnoticeably. */
 const PATH_BUDGET = 6
+
+/**
+ * Errands. An idle builder now and then walks over to another idle builder — on another
+ * plot, mostly — and the two stand and talk for a while before it walks home.
+ *
+ * This is the life the map has when nothing is running, and it is confined to the idle
+ * state on purpose: a builder that is working, waiting, stuck, celebrating or asleep is
+ * *saying* something, and an errand would talk over it. Idle says nothing, so it can go
+ * visiting. A dormant builder is never a host either — dormant things stay put.
+ */
+/** Seconds between one builder's errands, least and most. */
+const ERRAND_EVERY = [50, 150]
+/** How long a conversation lasts. */
+const CHAT_FOR = [7, 15]
+/** How far a builder will walk to find company. */
+const ERRAND_RANGE = 36
+/** Share of the idle crew that may be out visiting at once; the rest potter as before. */
+const ERRAND_SHARE = 0.2
+/** How close a visitor stands to its host: a pace, just outside the crowd spacing. */
+const CHAT_DISTANCE = 1.3
+
+/**
+ * Where a builder switches between its two bodies, in world units from the camera.
+ *
+ * At the resting overview a builder stands about twenty pixels tall, and the mannequin is
+ * six thousand triangles: fifteen triangles to the pixel, every one shaded as a whole 2×2
+ * quad by the rasteriser, twice a frame once the shadow pass is counted. Measured, that was
+ * the single largest cost in the frame on an integrated GPU — more than the ground — and
+ * none of it could be seen. Past `LOD_FAR` the body and the head's parts come from the
+ * clustered copies at a fifth of the triangles; inside `LOD_NEAR` the fine ones come back.
+ * The gap between the two is what stops a builder standing on the line from flickering.
+ *
+ * At 26 units a builder is about fifty pixels tall, which is where the coarse body first
+ * starts to read as coarse.
+ */
+const LOD_NEAR = 26
+const LOD_FAR = 30
+
+/** The parts whose colour is rewritten every frame — the ones that pulse. */
+const ANIMATED_PARTS = new Set(['tip', 'lamp'])
 
 /**
  * The mannequin is authored 2.2 units tall. The colony wants a "little guy" silhouette at
@@ -168,17 +215,6 @@ export class Astronauts {
     // rig is ever scaled again.
     const R = P.helmetR
 
-    // Helmet shell.
-    const helmetGeo = new THREE.SphereGeometry(R, 16, 11)
-    parts.helmet = this._mesh(helmetGeo, suit(0.26, { metalness: 0.03, envMapIntensity: 1.35 }), capacity, false)
-
-    // Visor: a dark screen wrapped onto the helmet. The patch itself is a rectangle in UV
-    // space, so its rounded silhouette is cut in the fragment shader instead — a squircle
-    // SDF, which gives soft corners a rectangular patch can never have, and lets the white
-    // helmet show through where the screen ends.
-    const visorGeo = sphereCap(R * 1.032, 2.45, Math.PI * 0.62, 20, 14)
-    parts.visor = this._mesh(visorGeo, this._visorMaterial(), capacity, false)
-
     // Backpack + a life-support cylinder on each side.
     const packGeo = roundedBox(R * 0.89, R * 0.98, R * 0.55, R * 0.19)
     parts.pack = this._mesh(packGeo, suit(0.66), capacity, true)
@@ -197,18 +233,27 @@ export class Astronauts {
     // than suit white, so it reads as a tool at the distance the colony is watched from.
     parts.hammer = this._mesh(hammerGeometry(R), suit(0.62, { vertexColors: true }), capacity, true)
 
-    // Face: the features only, drawn straight onto the visor beneath. Built as a sphere cap
-    // a hair larger than the visor, so it lies exactly on the curved surface instead of
-    // clipping through it — a flat plane at this radius sinks inside the sphere and the
-    // features disappear.
-    const faceGeo = sphereCap(P.helmetR * 1.047, 1.72, 0.98, 16, 10)
-    parts.face = this._mesh(faceGeo, this._faceMaterial(), capacity, false)
-    this._attachFrameAttribute(parts.face, capacity)
+    // A soft dark disc under each builder: the contact shadow the shadow map is too coarse
+    // to draw, and what keeps a figure standing *on* the deck rather than a pixel above it.
+    // Multiplied into whatever is under it, so it is a shadow on sand and on plate alike.
+    const blobGeo = new THREE.CircleGeometry(0.62 / CREW_SCALE, 18)
+    blobGeo.rotateX(-Math.PI / 2)
+    parts.blob = this._mesh(blobGeo, blobMaterial(), capacity, false)
+    parts.blob.renderOrder = 1
 
     for (const mesh of Object.values(parts)) {
       mesh.frustumCulled = false // one bounding volume for every agent everywhere is useless
       this.group.add(mesh)
     }
+
+    // The helmet, the visor and the face are the worn parts big enough to matter at a
+    // distance, so those come in two resolutions, alongside the two bodies: one set for
+    // builders near the camera and one for the rest. The materials are shared between the
+    // sets — only the geometry differs.
+    this.helmetMaterial = suit(0.26, { metalness: 0.03, envMapIntensity: 1.35 })
+    this.visorMaterial = this._visorMaterial()
+    this.faceMaterial = this._faceMaterial()
+    this.lods = [this._buildWorn(capacity, true), this._buildWorn(capacity, false)]
     this._applyShadowFlags()
 
     // Ground rings for hover + selection. Two ordinary meshes, moved around as needed.
@@ -220,7 +265,37 @@ export class Astronauts {
   }
 
   /**
-   * Hand over the baked crew rig and build the body mesh.
+   * One resolution of the parts that ride on the head: helmet shell, visor and face.
+   *
+   * The visor is a dark screen wrapped onto the helmet. The patch itself is a rectangle in
+   * UV space, so its rounded silhouette is cut in the fragment shader instead — a squircle
+   * SDF, which gives soft corners a rectangular patch can never have, and lets the white
+   * helmet show through where the screen ends. The face is the features only, drawn
+   * straight onto the visor beneath: a sphere cap a hair larger than the visor, so it lies
+   * exactly on the curved surface instead of clipping through it — a flat plane at this
+   * radius sinks inside the sphere and the features disappear.
+   *
+   * The coarse set has about a quarter of the triangles. Past the LOD line a helmet is a
+   * dozen pixels across, where a sphere of forty-eight faces and one of a hundred and
+   * seventy-six draw the same circle.
+   */
+  _buildWorn(capacity, fine) {
+    const R = P.helmetR
+    const helmet = this._mesh(new THREE.SphereGeometry(R, fine ? 16 : 8, fine ? 11 : 6), this.helmetMaterial, capacity, false)
+    const visor = this._mesh(sphereCap(R * 1.032, 2.45, Math.PI * 0.62, fine ? 20 : 8, fine ? 14 : 6), this.visorMaterial, capacity, false)
+    const face = this._mesh(sphereCap(R * 1.047, 1.72, 0.98, fine ? 16 : 8, fine ? 10 : 5), this.faceMaterial, capacity, false)
+    const frames = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 2), 2)
+    frames.setUsage(THREE.DynamicDrawUsage)
+    face.geometry.setAttribute('aFrame', frames)
+    for (const mesh of [helmet, visor, face]) {
+      mesh.frustumCulled = false
+      this.group.add(mesh)
+    }
+    return { helmet, visor, face, frames, crew: null, crewFrames: null, n: 0 }
+  }
+
+  /**
+   * Hand over the baked crew rig and build the body meshes.
    *
    * Split out from the constructor because the rig is a fetch: the colony is built before
    * boot has finished loading, and until this lands the crew is helmets and backpacks with
@@ -232,41 +307,45 @@ export class Astronauts {
     this.rig = rig
     this._disposeCrew()
 
-    const geo = rig.geometry.clone()
-    const frames = new Float32Array(this.capacity)
-    this.crewFrameAttr = new THREE.InstancedBufferAttribute(frames, 1)
-    this.crewFrameAttr.setUsage(THREE.DynamicDrawUsage)
-    geo.setAttribute('aFrame', this.crewFrameAttr)
-
     // One uniform block for the surface and the shadow pass, the same as the buildings do.
     this.crewUniforms = {
       uBones: { value: rig.boneTexture },
       uFrameMax: { value: rig.frameCount - 1 },
     }
 
-    const material = decorateSkinned(
+    this.crewMaterial = decorateSkinned(
       new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.68, metalness: 0.04 }),
       this.crewUniforms
     )
-
-    const mesh = new THREE.InstancedMesh(geo, material, this.capacity)
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
-    mesh.count = 0
-    mesh.receiveShadow = false
-    mesh.frustumCulled = false
-    const white = new THREE.Color(1, 1, 1)
-    for (let i = 0; i < this.capacity; i++) mesh.setColorAt(i, white)
-    mesh.instanceColor.setUsage(THREE.DynamicDrawUsage)
-
-    const depth = decorateSkinned(
+    this.crewDepth = decorateSkinned(
       new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking }),
       this.crewUniforms,
       { normals: false }
     )
-    mesh.customDepthMaterial = depth
 
-    this.crew = mesh
-    this.group.add(mesh)
+    // Two bodies from one bake: the mannequin as authored, and its clustered copy for the
+    // builders far from the camera. Same material, same bone table, same frame attribute;
+    // only the vertex count differs, and `_writeMatrices` decides who goes in which.
+    this.lods.forEach((lod, k) => {
+      const geo = (k === 0 ? rig.geometry : rig.geometryFar || rig.geometry).clone()
+      const frames = new THREE.InstancedBufferAttribute(new Float32Array(this.capacity), 1)
+      frames.setUsage(THREE.DynamicDrawUsage)
+      geo.setAttribute('aFrame', frames)
+
+      const mesh = new THREE.InstancedMesh(geo, this.crewMaterial, this.capacity)
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+      mesh.count = 0
+      mesh.receiveShadow = false
+      mesh.frustumCulled = false
+      const white = new THREE.Color(1, 1, 1)
+      for (let i = 0; i < this.capacity; i++) mesh.setColorAt(i, white)
+      mesh.instanceColor.setUsage(THREE.DynamicDrawUsage)
+      mesh.customDepthMaterial = this.crewDepth
+
+      lod.crew = mesh
+      lod.crewFrames = frames
+      this.group.add(mesh)
+    })
     this._applyShadowFlags()
 
     // Bones anything worn hangs off. Read back per frame from the same baked table the
@@ -283,12 +362,35 @@ export class Astronauts {
   }
 
   _disposeCrew() {
-    if (!this.crew) return
-    this.group.remove(this.crew)
-    this.crew.geometry.dispose()
-    this.crew.material.dispose()
-    this.crew.customDepthMaterial?.dispose()
-    this.crew = null
+    for (const lod of this.lods) {
+      if (!lod.crew) continue
+      this.group.remove(lod.crew)
+      lod.crew.geometry.dispose()
+      lod.crew = null
+      lod.crewFrames = null
+    }
+    this.crewMaterial?.dispose()
+    this.crewDepth?.dispose()
+    this.crewMaterial = null
+    this.crewDepth = null
+  }
+
+  /** Take down every instanced part — the single-set ones and both resolutions of the rest. */
+  _disposeWorn() {
+    for (const mesh of Object.values(this.parts)) {
+      this.group.remove(mesh)
+      mesh.geometry.dispose()
+      mesh.material.dispose()
+    }
+    for (const lod of this.lods) {
+      for (const mesh of [lod.helmet, lod.visor, lod.face]) {
+        this.group.remove(mesh)
+        mesh.geometry.dispose()
+      }
+    }
+    this.helmetMaterial.dispose()
+    this.visorMaterial.dispose()
+    this.faceMaterial.dispose()
   }
 
   _mesh(geo, mat, count, castShadow) {
@@ -365,7 +467,6 @@ export class Astronauts {
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uFrameScale = { value: new THREE.Vector2(1 / FRAME_COLS, 1 / FRAME_ROWS) }
       shader.uniforms.uGlow = { value: 1.85 }
-      this._faceUniforms = shader.uniforms
 
       shader.vertexShader = shader.vertexShader
         .replace(
@@ -401,22 +502,18 @@ export class Astronauts {
     return mat
   }
 
-  _attachFrameAttribute(mesh, capacity) {
-    const data = new Float32Array(capacity * 2)
-    const attr = new THREE.InstancedBufferAttribute(data, 2)
-    attr.setUsage(THREE.DynamicDrawUsage)
-    mesh.geometry.setAttribute('aFrame', attr)
-    this.frameAttr = attr
-  }
-
   _applyShadowFlags() {
     const on = this.settings.shadowSize > 0
     for (const [name, mesh] of Object.entries(this.parts)) {
-      const wants = name !== 'face' && name !== 'tip' && name !== 'lamp' && name !== 'visor'
-      mesh.castShadow = on && wants
+      mesh.castShadow = on && name !== 'tip' && name !== 'lamp' && name !== 'blob'
     }
-    // The body is the shadow that matters — it is the whole silhouette.
-    if (this.crew) this.crew.castShadow = on
+    for (const lod of this.lods) {
+      lod.helmet.castShadow = on
+      lod.visor.castShadow = false
+      lod.face.castShadow = false
+      // The body is the shadow that matters — it is the whole silhouette.
+      if (lod.crew) lod.crew.castShadow = on
+    }
   }
 
   /** The colony hands over the navigation grid once it has been built. */
@@ -429,8 +526,8 @@ export class Astronauts {
     if (changed.has('textureQuality')) {
       this.faceTexture.dispose()
       this.faceTexture = buildFaceAtlas(Math.min(this.settings.textureSize, 512))
-      this.parts.face.material.map = this.faceTexture
-      this.parts.face.material.needsUpdate = true
+      this.faceMaterial.map = this.faceTexture
+      this.faceMaterial.needsUpdate = true
     }
     if (changed.has('maxAgents')) {
       // The instanced buffers are sized at build time, so a bigger roster needs new ones.
@@ -438,17 +535,14 @@ export class Astronauts {
       if (wanted !== this.capacity) {
         const rig = this.rig
         this._disposeCrew()
-        for (const mesh of Object.values(this.parts)) {
-          this.group.remove(mesh)
-          mesh.geometry.dispose()
-          mesh.material.dispose()
-        }
+        this._disposeWorn()
         this.group.remove(this.hoverRing, this.selectRing)
         this._buildMeshes(wanted)
         this.rig = null
         this.setRig(rig)
         for (const agent of this.agents) {
           agent.index = -1
+          agent.lodSlot = -1
           agent.colorDirty = true
         }
       }
@@ -468,11 +562,14 @@ export class Astronauts {
     this.world = world || this.world
     const cap = Math.min(this.capacity, this.settings.get('maxAgents'))
     // Agents on their way back to the ship still hold a slot, so the roster has to leave room
-    // for them. Without this the clamp above would quietly drop whoever sorted last, which is
-    // better than an empty planet but still not what the scan said.
+    // for them.
     const leaving = this.agents.reduce((n, a) => n + (a.state === 'leaving' ? 1 : 0), 0)
-    const wanted = entries.slice(0, Math.max(1, cap - leaving))
+    // Over the cap, who is left out is decided by what each is asking for — a thread waiting on
+    // you outranks one that is merely idle — rather than by where the zones happened to sort.
+    const wanted = capRoster(entries, Math.max(1, cap - leaving))
     const seen = new Set()
+    /** Who has a builder right now, so the sidebar can tell drawn from asleep. */
+    this.drawn = new Set(wanted.map((e) => e.id))
 
     // The ramp is one door and the ship is a solid obstacle around it, so an entrance is a
     // queue. A handful arriving together is the shot the colony is for; a hundred is a scrum
@@ -496,6 +593,11 @@ export class Astronauts {
       if (!seen.has(agent.id) && agent.state !== 'leaving') this._sendHome(agent)
     }
     return this.agents.length
+  }
+
+  /** Does this thread have a builder on the island, as opposed to being over the cap? */
+  isDrawn(id) {
+    return this.drawn?.has(id) ?? false
   }
 
   _spawnAgent(entry, walksOut = true) {
@@ -554,6 +656,11 @@ export class Astronauts {
       frame: 0,
       wander: new THREE.Vector3(),
       wanderAt: 0,
+      // Errands: the current one, when the next may start, and a beat of its own for the
+      // gestures so a pair never moves in unison.
+      errand: null,
+      errandAt: 25 + Math.random() * 90,
+      talkPhase: 0,
       scale: walksOut ? 0 : 1, // pops up out of the ship, or was already standing there
       alive: true,
       path: null,
@@ -562,6 +669,11 @@ export class Astronauts {
       pathGoal: new THREE.Vector3(NaN, 0, NaN),
       colorDirty: true,
       index: -1,
+      // Which body it is drawn with (0 fine, 1 coarse), and its slot in that set last frame.
+      // Born coarse: the first frame measures the camera and promotes it if it is close.
+      lod: 1,
+      lodSlot: -1,
+      lodAt: -1,
       walkAmp: 0,
       screen: new THREE.Vector3(), // filled by the picker each frame
     }
@@ -596,6 +708,8 @@ export class Astronauts {
 
   /** Status change → new behaviour, new trim, new eye colour. */
   _applyStatus(agent, status) {
+    // Whatever it was doing on its own account, the thread now has something to say.
+    if (agent.errand) this._endErrand(agent)
     const look = AGENT_LOOK[status] || AGENT_LOOK.idle
     agent.trim.set(look.trim)
     agent.eye.setRGB(look.eye[0], look.eye[1], look.eye[2])
@@ -623,6 +737,7 @@ export class Astronauts {
 
   _sendHome(agent) {
     if (agent.state === 'leaving' || agent.state === 'gone') return
+    if (agent.errand) this._endErrand(agent)
     agent.state = 'leaving'
     agent.stateAge = 0
     agent.loop = null
@@ -639,7 +754,7 @@ export class Astronauts {
 
   // ── per-frame simulation ────────────────────────────────────────────────────────────
 
-  update(dt, elapsed) {
+  update(dt, elapsed, camera) {
     const reduced = this.settings.get('reducedMotion')
     const anim = reduced ? 0.35 : 1
     let write = 0
@@ -651,7 +766,7 @@ export class Astronauts {
       const agent = this.agents[i]
       agent.stateAge += dt
       this._step(agent, dt, elapsed, anim)
-      this._animate(agent, dt, anim)
+      this._animate(agent, dt, anim, elapsed)
       this._face(agent, dt)
 
       if (agent.state === 'gone') {
@@ -662,7 +777,7 @@ export class Astronauts {
       write++
     }
 
-    this._writeMatrices(elapsed, anim)
+    this._writeMatrices(elapsed, anim, camera)
     return write
   }
 
@@ -671,23 +786,21 @@ export class Astronauts {
    * Falls back to the goal itself when there is no path — an astronaut heading vaguely the
    * right way and sliding along walls beats one standing still because A* gave up.
    */
-  _steerTarget(agent, out) {
+  _steerTarget(agent, out, goal = agent.site) {
     const nav = this.nav
-    if (!nav) return out.copy(agent.site)
+    if (!nav) return out.copy(goal)
 
-    const stale =
-      agent.pathVersion !== nav.version ||
-      agent.pathGoal.distanceToSquared(agent.site) > 0.25
+    const stale = agent.pathVersion !== nav.version || agent.pathGoal.distanceToSquared(goal) > 0.25
     if (stale && this._routeBudget > 0) {
       this._routeBudget--
-      agent.path = nav.findPath(agent.pos.x, agent.pos.z, agent.site.x, agent.site.z)
+      agent.path = nav.findPath(agent.pos.x, agent.pos.z, goal.x, goal.z)
       agent.pathAt = 0
       agent.pathVersion = nav.version
-      agent.pathGoal.copy(agent.site)
+      agent.pathGoal.copy(goal)
     }
 
     const path = agent.path
-    if (!path || !path.length) return out.copy(agent.site)
+    if (!path || !path.length) return out.copy(goal)
 
     // Retire waypoints already reached, and any the agent can already see past.
     while (agent.pathAt < path.length - 1) {
@@ -697,31 +810,37 @@ export class Astronauts {
       if (dx * dx + dz * dz > WAYPOINT_REACHED * WAYPOINT_REACHED) break
       agent.pathAt++
     }
-    if (agent.pathAt >= path.length) return out.copy(agent.site)
+    if (agent.pathAt >= path.length) return out.copy(goal)
     const wp = path[agent.pathAt]
     return out.set(wp.x, 0, wp.z)
+  }
+
+  /** The vector to steer along toward `goal`, routed. Scratch: use it before the next call. */
+  _steerTo(agent, goal) {
+    const steer = this._steerTarget(agent, this._wp, goal)
+    return this._v.set(steer.x - agent.pos.x, 0, steer.z - agent.pos.z)
   }
 
   _step(agent, dt, elapsed, anim) {
     const fromX = agent.pos.x
     const fromZ = agent.pos.z
     agent.blocked = false
-    // Distance is always measured to the real goal; steering follows the route to it.
-    const steer = this._steerTarget(agent, this._wp)
-    const toSite = this._v.set(steer.x - agent.pos.x, 0, steer.z - agent.pos.z)
+    // Distance is always measured to the real goal; steering follows the route to it, and
+    // is only asked for by the states that walk somewhere.
+    const toSite = () => this._steerTo(agent, agent.site)
     const dist = Math.hypot(agent.site.x - agent.pos.x, agent.site.z - agent.pos.z)
 
     switch (agent.state) {
       case 'spawning': {
         agent.scale = Math.min(1, agent.scale + dt * 2.6)
         if (agent.stateAge > 0.9) agent.state = 'walking'
-        this._walk(agent, toSite, dist, dt, 0.55)
+        this._walk(agent, toSite(), dist, dt, 0.55)
         break
       }
 
       case 'walking': {
         agent.scale = Math.min(1, agent.scale + dt * 3)
-        this._walk(agent, toSite, dist, dt, 1)
+        this._walk(agent, toSite(), dist, dt, 1)
         // Close enough — settle into whatever this thread is actually doing. Or close
         // enough to *give up*: a site that something was built on top of between polls can
         // never be reached, and an astronaut shouldering a wall forever is worse than one
@@ -749,8 +868,13 @@ export class Astronauts {
 
       case 'at-site': {
         if (agent.status === 'idle') {
-          // Idlers potter around their plot, and `_drift` owns their velocity outright.
-          this._drift(agent, dt, elapsed)
+          // Idlers potter around their plot, and `_drift` owns their velocity outright —
+          // unless one is off on an errand, or has a visitor.
+          if (agent.errand) this._errand(agent, dt, elapsed)
+          else {
+            this._drift(agent, dt, elapsed)
+            if (elapsed > agent.errandAt) this._startErrand(agent, elapsed)
+          }
         } else if (agent.status === 'working' && agent.anchor) {
           this._workRound(agent, dt, elapsed)
         } else {
@@ -769,7 +893,7 @@ export class Astronauts {
 
       case 'leaving': {
         agent.scale = Math.max(0, agent.scale - (dist < 1.4 ? dt * 2.2 : 0))
-        this._walk(agent, toSite, dist, dt, 1.15)
+        this._walk(agent, toSite(), dist, dt, 1.15)
         // Reaching the ramp retires the agent; so does giving up on ever reaching it, so a
         // blocked path can never leave a ghost walking forever.
         if (agent.scale <= 0.001 || (dist < 0.9 && agent.stateAge > 1.5) || agent.stateAge > 22) {
@@ -1016,6 +1140,135 @@ export class Astronauts {
     this._settle(agent, dt)
   }
 
+  // ── errands ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Decide whether to go visiting, and whom.
+   *
+   * Nearer is likelier but not certain, or a builder would only ever visit its neighbour
+   * and the map would settle into pairs. The host has to be idle and at its post with
+   * nobody already on the way, and the visitor needs somewhere to stand beside it that is
+   * neither inside a wall nor on top of someone else.
+   */
+  _startErrand(agent, elapsed) {
+    agent.errandAt = elapsed + ERRAND_EVERY[0] + Math.random() * (ERRAND_EVERY[1] - ERRAND_EVERY[0])
+
+    let idle = 0
+    let out = 0
+    const candidates = []
+    for (const other of this.agents) {
+      if (other.status !== 'idle' || other.state !== 'at-site' || other.scale < 0.9) continue
+      idle++
+      if (other.errand) {
+        out++
+        continue
+      }
+      if (other === agent) continue
+      const d = Math.hypot(other.pos.x - agent.pos.x, other.pos.z - agent.pos.z)
+      // Too near is the same plot; too far is a hike nobody would watch to the end.
+      if (d < 5 || d > ERRAND_RANGE) continue
+      candidates.push({ other, d })
+    }
+    if (!candidates.length || out >= Math.max(1, Math.floor(idle * ERRAND_SHARE))) return
+
+    candidates.sort((a, b) => a.d - b.d)
+    const host = candidates[Math.min(candidates.length - 1, Math.floor(Math.random() * Math.random() * candidates.length))].other
+    const spot = this._spotBeside(host, agent)
+    if (!spot) return
+
+    agent.errand = { kind: 'visit', with: host, spot, phase: 'going', age: 0, since: elapsed, until: 0 }
+    // The host waits for a while, then gives up and potters on if nobody turns up.
+    host.errand = { kind: 'host', with: agent, spot: null, phase: 'waiting', age: 0, since: elapsed, until: elapsed + 40 }
+    agent.pathVersion = -1
+  }
+
+  /** Somewhere a pace from `host`, on the side `visitor` is coming from, that can be stood on. */
+  _spotBeside(host, visitor) {
+    const toward = Math.atan2(visitor.pos.z - host.pos.z, visitor.pos.x - host.pos.x)
+    for (const turn of [0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]) {
+      const a = toward + turn
+      const x = host.pos.x + Math.cos(a) * CHAT_DISTANCE
+      const z = host.pos.z + Math.sin(a) * CHAT_DISTANCE
+      if (this.nav?.isBlocked(x, z)) continue
+      if (this._crowded(x, z, host)) continue
+      return new THREE.Vector3(x, 0, z)
+    }
+    return null
+  }
+
+  /**
+   * One frame of an errand, for either party.
+   *
+   * Anything that breaks the pair — a status change, one of them leaving, the visitor not
+   * making it — ends it for both, and a visitor that is done simply walks home through the
+   * ordinary `walking` state. The host was home all along.
+   */
+  _errand(agent, dt, elapsed) {
+    const e = agent.errand
+    const partner = e.with
+    const paired = partner.errand && partner.errand.with === agent
+    if (!paired || partner.status !== 'idle' || partner.state === 'gone' || agent.status !== 'idle') {
+      this._endErrand(agent)
+      return
+    }
+    e.age += dt
+
+    if (e.kind === 'host') {
+      agent.vel.set(0, 0, 0)
+      if (e.phase === 'talking') this._faceToward(agent, partner.pos, dt)
+      else if (elapsed > e.until) {
+        this._endErrand(agent)
+        return
+      }
+      this._settle(agent, dt)
+      return
+    }
+
+    if (e.phase === 'going') {
+      const to = this._steerTo(agent, e.spot)
+      const left = Math.hypot(e.spot.x - agent.pos.x, e.spot.z - agent.pos.z)
+      this._walk(agent, to, left, dt, 0.85)
+      const near = Math.hypot(partner.pos.x - agent.pos.x, partner.pos.z - agent.pos.z)
+      const stuck = (agent.blocked && e.age > 6) || e.age > 30
+      if (near < CHAT_DISTANCE + 0.5 || left < 0.6 || stuck) {
+        if (near > CHAT_DISTANCE * 2.2) {
+          this._endErrand(agent) // could not get there; never mind
+          return
+        }
+        const until = elapsed + CHAT_FOR[0] + Math.random() * (CHAT_FOR[1] - CHAT_FOR[0])
+        e.phase = 'talking'
+        e.since = elapsed
+        e.until = until
+        agent.talkPhase = Math.random() * 6.28
+        partner.errand.phase = 'talking'
+        partner.errand.since = elapsed
+        partner.errand.until = until
+        partner.talkPhase = agent.talkPhase + 1.7
+      }
+      return
+    }
+
+    // Talking: stand, face each other, and let the clip and the face do the rest.
+    agent.vel.set(0, 0, 0)
+    this._faceToward(agent, partner.pos, dt)
+    this._settle(agent, dt)
+    if (elapsed > e.until) this._endErrand(agent)
+  }
+
+  _endErrand(agent) {
+    const e = agent.errand
+    if (!e) return
+    agent.errand = null
+    const partner = e.with
+    if (partner?.errand?.with === agent) partner.errand = null
+    // The visitor walks home; the host never left.
+    if (e.kind === 'visit' && agent.state === 'at-site') {
+      agent.state = 'walking'
+      agent.stateAge = 0
+      agent.pathVersion = -1
+    }
+  }
+
   _faceToward(agent, point, dt) {
     // Stand a little back from the build site and look at it.
     const dx = point.x - agent.pos.x
@@ -1056,7 +1309,7 @@ export class Astronauts {
       return
     }
 
-    const loop = agent.loop
+    const loop = agent.errand?.phase === 'talking' ? FACE_LOOPS.talking : agent.loop
     if (!loop || !loop.length) {
       agent.faceFrame = FACE.idle
       return
@@ -1079,7 +1332,7 @@ export class Astronauts {
    * cannot moonwalk — the same rule the old hand-written cycle followed, applied to a real
    * one instead.
    */
-  _animate(agent, dt, anim) {
+  _animate(agent, dt, anim, elapsed) {
     const rig = this.rig
     if (!rig) return
 
@@ -1112,6 +1365,13 @@ export class Astronauts {
           break
         default:
           key = 'idle'
+          // Mid-conversation: the visitor waves hello, then the two take turns gesturing on
+          // a beat offset between them, so they never move in unison.
+          if (agent.errand?.phase === 'talking') {
+            const e = agent.errand
+            if (e.kind === 'visit' && elapsed - e.since < 1.7) key = 'wave'
+            else key = Math.floor((elapsed + agent.talkPhase) / 3.4) % 2 === 0 ? 'interact' : 'idleAlt'
+          }
       }
     }
 
@@ -1138,10 +1398,10 @@ export class Astronauts {
 
   // ── writing the instance buffers ────────────────────────────────────────────────────
 
-  _writeMatrices(elapsed, anim) {
-    const { helmet, visor, pack, antenna, tip, lamp, face, hammer } = this.parts
+  _writeMatrices(elapsed, anim, camera) {
+    const { pack, antenna, tip, lamp, hammer, blob } = this.parts
+    const lods = this.lods
     const rig = this.rig
-    const crew = this.crew
     const root = this._m
     const child = this._m2
     const bone = this._m3
@@ -1150,9 +1410,10 @@ export class Astronauts {
     const e = this._e
     const v = this._v
     const one = this._one
-    const frames = this.frameAttr.array
-    const crewFrames = this.crewFrameAttr?.array
+    const cam = camera?.position
 
+    for (const lod of lods) lod.n = 0
+    const lodDirty = [false, false]
     let i = 0
     let hands = 0
     let staticDirty = false
@@ -1171,17 +1432,34 @@ export class Astronauts {
       const s = agent.scale
       if (s <= 0.001) continue
 
+      // Which body this builder gets this frame: hysteretic on its distance to the camera,
+      // so one standing right on the line does not flicker between the two.
+      if (cam) {
+        const dx = agent.pos.x - cam.x
+        const dy = agent.pos.y - cam.y
+        const dz = agent.pos.z - cam.z
+        const d2 = dx * dx + dy * dy + dz * dz
+        if (agent.lod === 1 && d2 < LOD_NEAR * LOD_NEAR) agent.lod = 0
+        else if (agent.lod === 0 && d2 > LOD_FAR * LOD_FAR) agent.lod = 1
+      }
+      const lod = lods[agent.lod]
+      const j = lod.n++
+
       // Root transform for the whole character. The rig is authored at 2.2 units tall, so
       // CREW_SCALE rides along here and everything downstream inherits it.
       e.set(0, agent.yaw, 0)
       q.setFromEuler(e)
       v.set(agent.pos.x, agent.pos.y, agent.pos.z)
       root.compose(v, q, one.setScalar(s * CREW_SCALE))
+      // The shadow stays on the ground when the builder does not — a celebrating hop lifts
+      // the figure and leaves its shadow where its feet will land.
+      v.y = (agent.groundY || 0) + 0.03
+      blob.setMatrixAt(i, child.compose(v, q, one))
       one.setScalar(1)
 
-      if (crew) {
-        crew.setMatrixAt(i, root)
-        crewFrames[i] = agent.frame
+      if (lod.crew) {
+        lod.crew.setMatrixAt(j, root)
+        lod.crewFrames.array[j] = agent.frame
       }
 
       // Everything worn hangs off a bone at the frame the body is actually on, so a helmet
@@ -1189,9 +1467,9 @@ export class Astronauts {
       if (rig) {
         attachMatrixAt(rig, agent.frame, this.headSlot, bone)
         worn.multiplyMatrices(root, bone)
-        setPart(child, worn, helmet, i, 0, P.headUp, 0, 0, 0, 0)
-        setPart(child, worn, visor, i, 0, P.headUp, 0, 0, 0, 0)
-        setPart(child, worn, face, i, 0, P.headUp, 0, 0, 0, 0)
+        setPart(child, worn, lod.helmet, j, 0, P.headUp, 0, 0, 0, 0)
+        setPart(child, worn, lod.visor, j, 0, P.headUp, 0, 0, 0, 0)
+        setPart(child, worn, lod.face, j, 0, P.headUp, 0, 0, 0, 0)
         setPart(child, worn, antenna, i, P.antX, P.antY, P.antZ, 0.06, 0, -0.12)
         setPart(child, worn, tip, i, P.tipX, P.tipY, P.antZ, 0, 0, 0)
 
@@ -1209,17 +1487,21 @@ export class Astronauts {
         }
       }
 
-      // Suit and trim only change when the status does, or when an agent leaving the roster
-      // shuffles everyone's slot along — so they are written on those frames, not all of them.
+      // Suit and trim only change when the status does, or when a slot moves — in the
+      // single set because somebody ahead left the roster, in a body set because somebody
+      // crossed the LOD line — so they are written on those frames, not all of them.
       const c = this._color
       if (agent.index !== i || agent.colorDirty) {
-        agent.colorDirty = false
-        crew?.setColorAt(i, c.setHex(agent.suit))
-        helmet.setColorAt(i, c.setHex(agent.suit))
         pack.setColorAt(i, agent.trim)
-        face.setColorAt(i, agent.eye)
         staticDirty = true
       }
+      if (agent.lodSlot !== j || agent.lodAt !== agent.lod || agent.colorDirty) {
+        lod.crew?.setColorAt(j, c.setHex(agent.suit))
+        lod.helmet.setColorAt(j, c.setHex(agent.suit))
+        lod.face.setColorAt(j, agent.eye)
+        lodDirty[agent.lod] = true
+      }
+      agent.colorDirty = false
 
       // Antenna tip and chest lamp pulse; a blocked agent's lamp stutters like a fault light.
       const pulse =
@@ -1231,28 +1513,33 @@ export class Astronauts {
 
       // Atlas frame for the face.
       const f = agent.faceFrame
-      frames[i * 2] = (f % FRAME_COLS) / FRAME_COLS
-      frames[i * 2 + 1] = 1 - (Math.floor(f / FRAME_COLS) + 1) / FRAME_ROWS
+      const frames = lod.frames.array
+      frames[j * 2] = (f % FRAME_COLS) / FRAME_COLS
+      frames[j * 2 + 1] = 1 - (Math.floor(f / FRAME_COLS) + 1) / FRAME_ROWS
 
       agent.index = i
+      agent.lodSlot = j
+      agent.lodAt = agent.lod
       i++
     }
 
     const n = i
     // The glowing parts pulse every frame; the rest only re-upload when something moved slot.
-    const animated = new Set(['tip', 'lamp'])
     for (const [name, mesh] of Object.entries(this.parts)) {
       mesh.count = name === 'hammer' ? hands : n
       mesh.instanceMatrix.needsUpdate = true
-      if (mesh.instanceColor && (staticDirty || animated.has(name))) mesh.instanceColor.needsUpdate = true
+      if (mesh.instanceColor && (staticDirty || ANIMATED_PARTS.has(name))) mesh.instanceColor.needsUpdate = true
     }
-    if (crew) {
-      crew.count = n
-      crew.instanceMatrix.needsUpdate = true
-      this.crewFrameAttr.needsUpdate = true
-      if (staticDirty && crew.instanceColor) crew.instanceColor.needsUpdate = true
-    }
-    this.frameAttr.needsUpdate = true
+    lods.forEach((lod, k) => {
+      for (const mesh of [lod.helmet, lod.visor, lod.face, lod.crew]) {
+        if (!mesh) continue
+        mesh.count = lod.n
+        mesh.instanceMatrix.needsUpdate = true
+        if (lodDirty[k] && mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+      }
+      lod.frames.needsUpdate = true
+      if (lod.crewFrames) lod.crewFrames.needsUpdate = true
+    })
     this.visibleCount = n
   }
 
@@ -1362,10 +1649,7 @@ export class Astronauts {
   }
 
   dispose() {
-    for (const mesh of Object.values(this.parts)) {
-      mesh.geometry.dispose()
-      mesh.material.dispose()
-    }
+    this._disposeWorn()
     this._disposeCrew()
     // The bone texture is the rig's, not this instance's — the rig outlives any one colony.
     this.faceTexture.dispose()
@@ -1471,6 +1755,35 @@ function sphereCap(radius, phiSpread, thetaSpread, wSeg = 18, hSeg = 12) {
     Math.PI / 2 - thetaSpread / 2,
     thetaSpread
   )
+}
+
+/**
+ * The contact shadow under a builder: black, faded in from the rim to the centre, laid over
+ * whatever is under it. Unlit and unfogged, so it is the same shadow on sand and on plate.
+ */
+function blobMaterial() {
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    transparent: true,
+    depthWrite: false,
+    fog: false,
+  })
+  mat.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n varying vec2 vBlob;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n vBlob = uv;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\n varying vec2 vBlob;')
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+         float d = length( vBlob - 0.5 ) * 2.0;
+         diffuseColor.rgb = vec3( 0.0 );
+         diffuseColor.a = pow( max( 0.0, 1.0 - d ), 1.4 ) * 0.45;`
+      )
+  }
+  mat.customProgramCacheKey = () => 'crew-blob'
+  return mat
 }
 
 function ring(inner, outer, color, opacity) {

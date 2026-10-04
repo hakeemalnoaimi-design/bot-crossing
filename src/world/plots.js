@@ -17,10 +17,44 @@ import { mulberry } from './planet.js'
  * repo lands where you are already looking and quiet ones ring the edge.
  */
 
+/**
+ * The default zone colours. A world may bring its own — see `palette` on a planet preset.
+ *
+ * Twenty-four, because a real roster outgrew twelve: with seventeen zones, five of them had
+ * to share a colour with another. The second dozen were chosen by farthest-point search in
+ * Lab against the first, and held under the deck's lightness cap (see `DECK_MAX_LIGHTNESS`)
+ * so that no deck colour moved. The first twelve are untouched.
+ */
 export const PLOT_PALETTE = [
   0xc96442, 0x4f9a63, 0x4f7ec9, 0xb8942a, 0x8b5cc9, 0xc94f8b,
   0x3fa8a0, 0xc97f4f, 0x6f8f4f, 0x5c7fc9, 0xc95c5c, 0x7f6fc9,
+  0x86698b, 0xb3c04d, 0xc04db3, 0x4da5c0, 0x996150, 0x4dc06c,
+  0xa89b7e, 0x893fa0, 0x69818b, 0x4dc0a5, 0x6186b8, 0xa03f7c,
 ]
+
+/**
+ * How light a deck is allowed to get. Every colour in `PLOT_PALETTE` already lands under
+ * this — the highest is 0.334 — so for those the cap never fires and the deck is exactly
+ * what it always was.
+ *
+ * It exists for a pale palette. The deck is derived by desaturating the zone's accent, which
+ * quietly assumed an accent of middling lightness: hand it pearl white and the plate comes
+ * out at 0.75, a near-white slab that the buildings standing on it disappear into. The cap
+ * is on lightness rather than on the palette because the next pale world would hit it too.
+ */
+const DECK_MAX_LIGHTNESS = 0.34
+const _deckHsl = {}
+
+/**
+ * Dark and nearly desaturated: the deck is a backdrop for buildings, and the accent belongs
+ * on the border where it can outline the zone without shouting.
+ */
+export function deckColor(accent) {
+  const color = new THREE.Color(accent).offsetHSL(0, -0.38, 0).multiplyScalar(0.9)
+  color.getHSL(_deckHsl)
+  if (_deckHsl.l > DECK_MAX_LIGHTNESS) color.setHSL(_deckHsl.h, _deckHsl.s, DECK_MAX_LIGHTNESS)
+  return color
+}
 
 /** Hex size, centre to corner. Cells tile exactly at this radius. */
 const CELL = 7.6
@@ -56,7 +90,14 @@ const DECK_SKIRT = 0.4
 const DECK_HEIGHT = DECK_TOP + DECK_SKIRT
 /** Building slots per cell: one in the middle and six around it. */
 const SLOTS_PER_CELL = 7
+/**
+ * A zone's footprint stops here, and with it its capacity: 9 × 7 = 63 buildings. Raised, a big
+ * zone pushes the rest of the colony out past the flat ground and into the dunes, so the answer
+ * to a bigger roster is "+N more", not a bigger zone. The count that sizes a zone is what will be
+ * *drawn* (folded dormant threads are gone before it is asked), not the repo's total.
+ */
 const MAX_CELLS = 9
+export const ZONE_CAPACITY = MAX_CELLS * SLOTS_PER_CELL
 /** The lattice cell the ship owns. Nothing else may be placed there. */
 const SHIP_CELL = { q: -2, r: 1 }
 
@@ -198,18 +239,68 @@ function isConnected(out) {
   return seen.size === cells.size
 }
 
-export function allocateCells(projects, previous = new Map()) {
-  const laid = layOut(projects, previous)
+/**
+ * How far out a cell *centre* may sit so that its whole tile still lies on flat ground whose
+ * radius is `limit`: a tile reaches `CELL` past its centre, and the terrain needs a little
+ * more than that before it starts to rise.
+ */
+export const layoutReach = (limit) => limit - CELL - 2
+
+/**
+ * How far the outermost corner of any tile in a layout is from the middle of the map — the
+ * number the flat ground and the walkable grid are sized from.
+ */
+export function layoutExtent(layout) {
+  let far = 0
+  for (const [, cells] of layout) {
+    for (const { q, r } of cells) {
+      const { x, z } = hexToWorld(q, r)
+      far = Math.max(far, Math.hypot(x, z) + CELL)
+    }
+  }
+  return far
+}
+
+/**
+ * @param reach the furthest a cell centre may be from the middle (see `layoutReach`). Left
+ *   out, the lattice is unbounded and a roster simply sprawls.
+ */
+export function allocateCells(projects, previous = new Map(), reach = Infinity) {
+  const laid = layOut(projects, previous, reach)
   // Remembering where a zone sat is worth a great deal, right up until it leaves the colony
   // as scattered islands. Then the memory is describing a map that no longer exists, and
   // starting over — compact, from the middle, the way a first run does it — is the lesser
   // upheaval. It only happens when the alternative is visibly broken.
-  return isConnected(laid) ? laid : layOut(projects, new Map())
+  return isConnected(laid) ? laid : layOut(projects, new Map(), reach)
 }
 
-function layOut(projects, previous) {
+function layOut(projects, previous, reach) {
   const reserved = key(SHIP_CELL.q, SHIP_CELL.r)
+  const inReach = (c) => {
+    const { x, z } = hexToWorld(c.q, c.r)
+    return Math.hypot(x, z) <= reach
+  }
   const wanted = projects.map((p) => ({ id: p.id, want: cellsNeeded(p.size) }))
+
+  // Bounded ground holds only so many tiles. When the roster wants more, the biggest zones give
+  // up a tile at a time until it fits — a zone is packed tighter, and its last threads become
+  // "+N more" — rather than a ring of tiles being laid out on the dunes. A fifth is held back
+  // so a blob is never hemmed in by its neighbours with nowhere left to grow.
+  if (Number.isFinite(reach)) {
+    let room = 0
+    for (let ring = 0; ring < 12; ring++) {
+      for (const cell of hexRing(ring)) if (key(cell.q, cell.r) !== reserved && inReach(cell)) room++
+    }
+    const budget = Math.floor(room * 0.8)
+    let spent = wanted.reduce((n, w) => n + w.want, 0)
+    while (spent > budget) {
+      let big = null
+      for (const w of wanted) if (w.want > 1 && (!big || w.want >= big.want)) big = w
+      if (!big) break
+      big.want--
+      spent--
+    }
+  }
   const total = wanted.reduce((n, w) => n + w.want, 0)
 
   // Spiral order decides where a *new* project settles. The pool runs past what is needed
@@ -228,7 +319,7 @@ function layOut(projects, previous) {
   for (let ring = 0; (pool.length < total + 30 || ring <= farthest) && ring < 12; ring++) {
     for (const cell of hexRing(ring)) {
       const k = key(cell.q, cell.r)
-      if (k === reserved) continue
+      if (k === reserved || !inReach(cell)) continue
       pool.push(cell)
       free.add(k)
     }
@@ -241,11 +332,15 @@ function layOut(projects, previous) {
     // The root cell is the whole point — it is the zone's origin, and everything standing
     // on the zone is placed relative to it. A blob that loses its root has *moved*, so if
     // the root is gone this project is seeded afresh rather than quietly re-rooted onto
-    // whichever of its old cells happens to still be free.
+    // whichever of its old cells happens to still be free. The same goes for a root that has
+    // fallen outside the flat ground: it is not in `free`, so the zone is seeded afresh.
     if (!free.has(key(before[0].q, before[0].r))) continue
     const keep = []
     for (const cell of before) {
       if (keep.length >= want) break // shrunk: whatever it claimed last is what it gives up
+      // Past the flat ground the rest of the list is lost with it — claimed last, given up
+      // first — and the blob grows back inside rather than skipping over the gap.
+      if (!inReach(cell)) break
       const k = key(cell.q, cell.r)
       if (!free.has(k)) continue // the ship's cell, or a duplicate in a hand-edited file
       free.delete(k)
@@ -449,6 +544,14 @@ export class Plot {
     this.group.position.copy(this.center)
     this.group.name = `plot:${id}`
 
+    /**
+     * The point in the evening this plot's lamps come on, as a night factor (0 day, 1
+     * night). Spread from golden hour to just past sunset, so across the map the lights
+     * come on a plot at a time rather than the whole island at once.
+     */
+    this.lightsAt = 0.28 + (((hashString(id) >>> 3) % 1000) / 1000) * 0.42
+    this._litAt = 0
+
     this._buildDeck()
     this._buildBorder()
     this._buildPosts()
@@ -474,15 +577,11 @@ export class Plot {
     const geo = BufferGeometryUtils.mergeGeometries(parts)
     parts.forEach((g) => g.dispose())
 
-    // Dark and nearly desaturated: the deck is a backdrop for buildings, and the accent
-    // belongs on the border where it can outline the zone without shouting. The plate
-    // pattern arrives as a texture and this tints it, which is why the drawing is authored
-    // neutral grey.
-    // Dark, but not black. The deck is a backdrop and wants to sit under the buildings
-    // rather than compete with them — but its rim faces sideways, so whatever the top reads
-    // as in full sun the edge reads as one stop darker, and a backdrop that goes to nothing
-    // at the plot boundary just looks like a hole.
-    const color = new THREE.Color(this.accent).offsetHSL(0, -0.38, 0).multiplyScalar(0.9)
+    // The plate pattern arrives as a texture and this tints it, which is why the drawing is
+    // authored neutral grey. Dark, but never black: the deck's rim faces sideways, so
+    // whatever the top reads as in full sun the edge reads as one stop darker, and a
+    // backdrop that goes to nothing at the plot boundary just looks like a hole.
+    const color = deckColor(this.accent)
     const plate = deckSurface()
     this.deck = new THREE.Mesh(
       geo,
@@ -558,18 +657,44 @@ export class Plot {
     this.group.add(this.border)
   }
 
-  /** A lamp post on one corner of each cell — the plot's own night lighting. */
+  /**
+   * A lamp post on one corner of each cell — the plot's own night lighting — and, under
+   * each, the pool of light it throws on the deck.
+   *
+   * The lamps do not fade up with the dusk; they *come on*. Each plot has a moment in the
+   * evening that is its own (`lightsAt`), and when the sky reaches it the lamps strike one
+   * after another over most of a second, each stuttering like a tube before it holds. That
+   * is the one time of day the whole map visibly does something, and it is what makes dusk
+   * an event rather than a gradient. All of it is one uniform per plot — seconds since the
+   * switch — and a delay per lamp; the pools on the deck share both.
+   */
   _buildPosts() {
+    const rand = mulberry(hashString(this.id) + 41)
     const posts = []
     const lamps = []
+    const pools = []
+    const delayOf = (geo, delay) => {
+      const count = geo.attributes.position.count
+      geo.setAttribute('aDelay', new THREE.BufferAttribute(new Float32Array(count).fill(delay), 1))
+    }
     this.localCenters.forEach(({ x, z }, i) => {
       const [px, pz] = corner(x, z, (i * 2) % 6, TILE * 0.72)
       const pole = new THREE.CylinderGeometry(0.055, 0.085, 1.8, 6)
       pole.translate(px, DECK_TOP + 0.9, pz)
       posts.push(pole)
+
+      const delay = rand() * 0.9
       const head = new THREE.SphereGeometry(0.14, 8, 6)
       head.translate(px, DECK_TOP + 1.84, pz)
+      delayOf(head, delay)
       lamps.push(head)
+
+      // Flat on the deck, a hair above it so it never fights the plate for the pixel.
+      const pool = new THREE.CircleGeometry(1.5, 20)
+      pool.rotateX(-Math.PI / 2)
+      pool.translate(px, DECK_TOP + 0.015, pz)
+      delayOf(pool, delay)
+      pools.push(pool)
     })
 
     const poleMesh = new THREE.Mesh(
@@ -577,12 +702,18 @@ export class Plot {
       new THREE.MeshStandardMaterial({ color: 0x9a9aa2, roughness: 0.7, metalness: 0.3 })
     )
     poleMesh.castShadow = true
-    this.lampMaterial = new THREE.MeshBasicMaterial({ color: this.accent, toneMapped: true })
+
+    /** Seconds since this plot's lamps were switched on, or -1 while they are off. */
+    this.lampUniforms = { uSince: { value: -1 } }
+    this.lampMaterial = lampMaterial(this.accent, this.lampUniforms)
     this.lamps = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(lamps), this.lampMaterial)
-    this._lampBase = new THREE.Color(this.accent)
-    this.group.add(poleMesh, this.lamps)
+    this.poolMaterial = poolMaterial(this.accent, this.lampUniforms)
+    this.pools = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pools), this.poolMaterial)
+    this.pools.renderOrder = 2
+    this.group.add(poleMesh, this.lamps, this.pools)
     posts.forEach((g) => g.dispose())
     lamps.forEach((g) => g.dispose())
+    pools.forEach((g) => g.dispose())
   }
 
   /**
@@ -665,8 +796,18 @@ export class Plot {
     return slots
   }
 
+  /** How many buildings this zone can hold. Past it, a thread has no building at all. */
+  get capacity() {
+    return this.slots.length
+  }
+
+  /**
+   * No wrap-around. It used to be `index % slots.length`, so thread 64 in a full zone was
+   * stacked inside thread 1's building and nothing said so. The colony fits a zone's threads
+   * to `capacity` before asking, and the ones that do not fit are reported as "+N more".
+   */
   slotFor(index) {
-    return this.slots[index % this.slots.length]
+    return this.slots[index]
   }
 
   worldSlot(index, out = new THREE.Vector3()) {
@@ -677,10 +818,18 @@ export class Plot {
   /** Night lighting, plus a pulse on the border when this plot holds something urgent. */
   setNight(night, urgent, elapsed) {
     if (this.borderMaterial) {
+      // Runway-edge lighting, not a neon sign: bright enough after dark to draw the zone's
+      // outline, not so bright that a pale accent blooms into a white halo round the plot.
       this.borderMaterial.emissiveIntensity =
-        0.3 + night * 1.4 + (urgent ? 0.4 + Math.sin(elapsed * 3.4) * 0.32 : 0)
+        0.25 + night * 0.75 + (urgent ? 0.4 + Math.sin(elapsed * 3.4) * 0.32 : 0)
     }
-    this.lampMaterial.color.copy(this._lampBase).multiplyScalar(0.5 + night * 2.4)
+    // The lamps come on at this plot's own moment in the evening, and go off at dawn — a
+    // little later than they came on, so a sky hovering at the line does not flick them.
+    const since = this.lampUniforms.uSince
+    const on = since.value >= 0
+    if (!on && night >= this.lightsAt) this._litAt = elapsed
+    const lit = night >= this.lightsAt || (on && night >= this.lightsAt - 0.08)
+    since.value = lit ? elapsed - this._litAt : -1
   }
 
   dispose() {
@@ -691,6 +840,65 @@ export class Plot {
       }
     })
   }
+}
+
+// ── lamps ─────────────────────────────────────────────────────────────────────────────
+
+/** The strike: dark before its moment, a stutter for most of a second, then steady. */
+const LAMP_STRIKE = /* glsl */ `
+  float lampOn( float t ) {
+    if ( t < 0.0 ) return 0.0;
+    if ( t > 0.8 ) return 1.0;
+    return fract( t * 6.5 ) > 0.42 ? 1.0 : 0.12;
+  }`
+
+/** The lamp head. Dim by day; well past 1.0 when lit, so the bloom pass picks it out. */
+function lampMaterial(accent, uniforms) {
+  const mat = new THREE.MeshBasicMaterial({ color: accent, toneMapped: true })
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uSince = uniforms.uSince
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n attribute float aDelay;\n uniform float uSince;\n varying float vOn;\n ${LAMP_STRIKE}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n vOn = lampOn( uSince - aDelay );`)
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n varying float vOn;`)
+      .replace('#include <color_fragment>', `#include <color_fragment>\n diffuseColor.rgb *= 0.35 + vOn * 2.6;`)
+  }
+  mat.customProgramCacheKey = () => 'plot-lamp'
+  return mat
+}
+
+/**
+ * The pool of light under a lamp: an additive disc on the deck, warmer than the accent,
+ * that comes on with the lamp above it. From the overview this is most of what "the lights
+ * came on" looks like — a lamp head is three pixels, its pool is thirty.
+ */
+function poolMaterial(accent, uniforms) {
+  const warm = new THREE.Color(accent).lerp(new THREE.Color(0xffd9a0), 0.55)
+  const mat = new THREE.MeshBasicMaterial({
+    color: warm,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    toneMapped: true,
+  })
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uSince = uniforms.uSince
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n attribute float aDelay;\n uniform float uSince;\n varying float vOn;\n varying vec2 vPool;\n ${LAMP_STRIKE}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n vOn = lampOn( uSince - aDelay );\n vPool = uv;`)
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n varying float vOn;\n varying vec2 vPool;`)
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+         float edge = length( vPool - 0.5 ) * 2.0;
+         float pool = pow( max( 0.0, 1.0 - edge ), 1.7 );
+         diffuseColor.a *= pool * vOn * 0.4;`
+      )
+  }
+  mat.customProgramCacheKey = () => 'plot-pool'
+  return mat
 }
 
 // ── labels ────────────────────────────────────────────────────────────────────────────

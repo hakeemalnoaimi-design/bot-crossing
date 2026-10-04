@@ -14,6 +14,7 @@ import {
   fetchState,
   saveState,
   openThread,
+  retryThread,
   newSession,
   revealFolder,
 } from './game/api.js'
@@ -29,12 +30,14 @@ import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-project
  */
 
 const POLL_MS = 15000
+/** How long an archive can be taken back from its toast. */
+const UNDO_MS = 5000
 const app = document.getElementById('app')
 
 app.insertAdjacentHTML(
   'beforeend',
   `<div class="boot"><div class="inner">
-     <h1>Bot Crossing</h1>
+     <h1>BotsBay World</h1>
      <p>Scanning for agent threads…</p>
      <div class="bar"><i></i></div>
    </div></div>`
@@ -57,8 +60,16 @@ let selectedId = null
 /** Which zone's sidebar is open. A repo, not a thread — they outlive the threads on them. */
 let selectedProject = null
 let hoverId = null
-let statusCursor = 0
+/**
+ * Where N and the counters left off, per status. One shared cursor meant pressing N, then the
+ * Blocked counter, then N again skipped people: each list is walked from its own last stop.
+ */
+const statusCursor = new Map()
+/** The archive the toast can still take back, so `U` can answer it too. */
+let lastArchived = null
 let pendingSave = 0
+/** A retry is on the wire. Module state rather than the button, so the `R` key sees it too. */
+let retrying = false
 const hoverGround = new THREE.Vector3()
 
 // ── actions the HUD can trigger ────────────────────────────────────────────────────────
@@ -73,7 +84,7 @@ const actions = {
     const url = engine.canvas.toDataURL('image/png')
     const a = document.createElement('a')
     a.href = url
-    a.download = `bot-crossing-${colony.planet.id}-${stamp()}.png`
+    a.download = `botsbay-world-${colony.planet.id}-${stamp()}.png`
     a.click()
     hud.toast('Screenshot saved')
   },
@@ -107,11 +118,15 @@ const actions = {
     const key = status === 'agents' ? null : status
     const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
     if (!pool.length) {
-      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
+      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No builders on the island')
       return
     }
     pool.sort((a, b) => a.id.localeCompare(b.id))
-    const agent = pool[statusCursor++ % pool.length]
+    // The next one *after* whoever was last visited, by id, so a pool that gained or lost
+    // somebody since the last press still carries on from the right place.
+    const at = pool.findIndex((a) => a.id === statusCursor.get(key ?? 'agents'))
+    const agent = pool[(at + 1) % pool.length]
+    statusCursor.set(key ?? 'agents', agent.id)
     select(agent.id, { fly: true })
   },
 
@@ -134,6 +149,9 @@ const actions = {
   select: (id) => select(id, {}),
 
   focusThread: (id) => select(id, { fly: true }),
+
+  /** A thread with no builder has nothing to fly to, so its row opens the thread instead. */
+  openById: (id) => actions.openThread(id),
 
   /**
    * A new thread in this repo. The desktop app opens an empty session with the folder as
@@ -182,7 +200,7 @@ const actions = {
     state.viewedAt = { ...(state.viewedAt || {}), [thread.id]: Date.now() }
     queueSave()
     applyThreads(threads)
-    hud.toast(`Marked ${thread.title.slice(0, 40)} as viewed`)
+    hud.toast(`Marked ${titleOf(thread).slice(0, 40)} as viewed`)
   },
 
   hideProject: () => {
@@ -197,7 +215,7 @@ const actions = {
     }
     selectedProject = null
     applyThreads(threads)
-    hud.toast(`Hidden ${name} — still in your harness, gone from the colony`)
+    hud.toast(`Hidden ${name} — still in your harness, gone from the island`)
   },
 
   unhideProject: (name) => {
@@ -222,8 +240,12 @@ const actions = {
     }
   },
 
-  openThread: async () => {
-    const thread = threads.find((t) => t.id === selectedId)
+  /**
+   * Open a thread in the harness it came from. With no id it is the selected builder's; with one
+   * it is a row in the sidebar's Asleep group, which has no builder to select.
+   */
+  openThread: async (id = selectedId) => {
+    const thread = threads.find((t) => t.id === id)
     if (!thread) return
     try {
       await openThread(thread)
@@ -233,6 +255,37 @@ const actions = {
       setTimeout(poll, 1800)
     } catch (err) {
       hud.toast(err.message || 'Could not open that thread', 'err')
+    }
+  },
+
+  /**
+   * Ask the harness to run this thread again.
+   *
+   * The only action here that changes anything outside this machine, and the only one a thread
+   * has to opt into: the button is drawn from `canRetry`, which the adapter sets, so nothing on
+   * this side knows what is retryable or what running again even means. A poll is queued
+   * afterwards because the answer — a new run, in a new state — is on the next scan.
+   */
+  retryThread: async () => {
+    // One at a time. The server refuses a second retry too, but the button and `R` should not
+    // even ask: a double click is the likeliest way to run a production workflow twice.
+    if (retrying) return
+    const thread = threads.find((t) => t.id === selectedId)
+    if (!thread || !thread.canRetry) return
+    // This re-runs a live workflow, side effects and all, so it is the one action that asks first.
+    if (!window.confirm(`Re-run the failed execution of “${titleOf(thread)}” in n8n? This runs the production workflow again.`)) return
+    retrying = true
+    hud.setRetryBusy(true)
+    try {
+      const done = await retryThread(thread)
+      hud.toast(done.message || 'Retrying')
+      setTimeout(poll, 1800)
+    } catch (err) {
+      // The server's refusal (already retried, a newer run, no longer failed) arrives as the message.
+      hud.toast(err.message || 'Could not retry that', 'err')
+    } finally {
+      retrying = false
+      hud.setRetryBusy(false)
     }
   },
 
@@ -253,12 +306,35 @@ const actions = {
     // click. That is the setting working, but silently it reads as the colony breaking, so
     // it says which repo went and why.
     const folded = [...(colony.dormantProjects || [])].filter((n) => !foldedBefore.has(n))
+    // No confirm: archiving only ever touches the colony's own list, so the way to be forgiving
+    // is to take it back, not to ask first.
+    lastArchived = thread.id
     hud.toast(
       folded.length
         ? `Archived — ${folded.join(', ')} ${folded.length === 1 ? 'is' : 'are'} all quiet now, folded off the map`
-        : 'Archived — heading home'
+        : 'Archived — heading home',
+      '',
+      { ms: UNDO_MS, action: { label: 'Undo', run: () => actions.unarchiveThread(thread.id) } }
     )
     colony.ship.ping()
+  },
+
+  /** Bring one back: the Archived list's button, the toast's Undo, and `U`. */
+  unarchiveThread: (id) => {
+    if (!id || !state.archived.includes(id)) return
+    state.archived = state.archived.filter((a) => a !== id)
+    const { [id]: _gone, ...rest } = state.archivedAt || {}
+    state.archivedAt = rest
+    if (lastArchived === id) lastArchived = null
+    queueSave()
+    applyThreads(threads)
+    const thread = threads.find((t) => t.id === id)
+    hud.toast(`Restored ${thread ? titleOf(thread).slice(0, 40) : 'the thread'}`)
+  },
+
+  /** `U`: undo the archive the toast is still offering. */
+  undoArchive: () => {
+    if (lastArchived) actions.unarchiveThread(lastArchived)
   },
 
   uiVisibility: (visible) => colony.setUiVisible(visible),
@@ -272,12 +348,34 @@ const actions = {
 }
 
 const hud = new Hud(app, settings, actions)
+
+/**
+ * Say which chip is drawing the page, once, if the governor has had to back off on it.
+ *
+ * Profiled, the machine this was built on has two GPUs and the browser was using the slow
+ * one — the render scale settling in the fifties was that, not the island. A page cannot
+ * pick its GPU; the only lever is a setting in Windows, and the only useful thing to do is
+ * to name the chip so somebody knows to look. Only integrated parts are named, and only
+ * when the scale actually dropped: a machine holding full resolution has nothing to hear.
+ */
+let gpuHinted = false
+engine.onAutoScaled = () => {
+  if (gpuHinted) return
+  const gpu = engine.gpuName
+  if (!/intel|iris|uhd|vega|radeon\(tm\) graphics|apple m|adreno|mali/i.test(gpu)) return
+  gpuHinted = true
+  const name = gpu.replace(/^ANGLE \(\w+, /, '').replace(/ Direct3D.*$/, '').replace(/\(0x[0-9a-f]+\)/i, '').trim()
+  hud.hint(`Drawing on ${name}, below full resolution — on a laptop with a second GPU, set your browser to High performance in Windows Graphics settings`, 11000)
+}
 // The sidebar is permanent, so the card beside an astronaut has a wall to stay clear of.
 const sideWidth = () => (window.innerWidth <= 820 ? 0 : 334)
 hud.setSideWidth(sideWidth())
 window.addEventListener('resize', () => hud.setSideWidth(sideWidth()))
 
 // ── selection ─────────────────────────────────────────────────────────────────────────
+
+/** A thread's title, for a sentence. Adapters promise one; a half-written record has been seen without. */
+const titleOf = (thread) => String(thread?.title || 'Untitled thread')
 
 function select(id, { fly = false } = {}) {
   selectedId = id
@@ -300,7 +398,7 @@ function select(id, { fly = false } = {}) {
   }
 }
 
-/** Open a zone's sidebar. Any selected astronaut from a different zone lets go. */
+/** Open a zone's sidebar. Any selected builder from a different zone lets go. */
 function selectProject(name, { fly = false } = {}) {
   if (!name || !colony.plots.has(name)) return
   selectedProject = name
@@ -383,6 +481,12 @@ function syncProject() {
       title: thread.title,
       worktree: thread.worktree,
       lastActivityAt: thread.lastActivityAt,
+      lastRunAt: thread.lastRunAt,
+      staleSince: thread.staleSince,
+      harness: thread.harness,
+      // Has a builder on the island. The rest are over the cap or past the zone's slots, and
+      // clicking one cannot fly anywhere — the sidebar lists them apart, with Open instead.
+      drawn: colony.astronauts.isDrawn(thread.id),
       status: statusFor(thread, now),
     }))
     // Whoever wants something first, then most recently touched — the same order of
@@ -491,10 +595,31 @@ engine.canvas.addEventListener('pointerleave', () => {
 
 // ── keyboard ──────────────────────────────────────────────────────────────────────────
 
+/** Whether an event came from something that has its own idea of what Enter and letters mean. */
+function fromControl(t) {
+  if (!(t instanceof Element)) return false
+  // Anywhere inside the HUD counts: a focused row or chip is the thing being operated, and a
+  // second handler here would act on the selected thread behind its back.
+  return Boolean(t.closest('button, input, select, textarea, a, [contenteditable], .hud'))
+}
+
 window.addEventListener('keydown', (e) => {
-  // Never steal keys from a field the user is actually typing in.
   const t = e.target
-  if (t instanceof HTMLInputElement || t instanceof HTMLSelectElement || t instanceof HTMLTextAreaElement) return
+  const typing = t instanceof HTMLInputElement || t instanceof HTMLSelectElement || t instanceof HTMLTextAreaElement
+
+  // One step at a time, outward — and before the typing check, so Esc closes Settings from a
+  // slider or a dropdown too. The search box handles its own Esc.
+  if (e.key === 'Escape' && !(t instanceof HTMLInputElement && t.type === 'search')) {
+    if (document.querySelector('.help.open')) hud.toggleHelp(false)
+    else if (hud.isSettingsOpen()) hud.toggleSettings(false)
+    else if (hud.searching) hud.clearSearch()
+    else if (selectedId) select(null, {})
+    else if (selectedProject) actions.closeProject()
+    return
+  }
+
+  // Never steal keys from a field the user is actually typing in.
+  if (typing) return
 
   // ⌘\ (⌃\ elsewhere) dismisses the chrome, the same as H — the shortcut every editor
   // uses for its sidebar, and the one hand that is already on the keyboard.
@@ -504,6 +629,10 @@ window.addEventListener('keydown', (e) => {
     return
   }
   if (e.metaKey || e.ctrlKey || e.altKey) return
+
+  // These act on whatever is selected, so they only fire from the canvas or the page. With
+  // focus on a button, Enter presses the button; with it in a list row, the row is the target.
+  if (fromControl(t) && ['Enter', 'a', 'A', 'r', 'R', 'v', 'V', 'c', 'C', 'n', 'N', 'u', 'U'].includes(e.key)) return
 
   switch (e.key) {
     case 'h':
@@ -530,9 +659,19 @@ window.addEventListener('keydown', (e) => {
     case 'O':
       hud.setOrbit(actions.toggleOrbit())
       break
-    case 'Tab':
-      e.preventDefault()
+    // Tab used to change the world, from anywhere. It is the key that moves through the panels,
+    // and taking it left a keyboard with no way into the HUD at all.
+    case 'w':
+    case 'W':
       actions.cyclePlanet()
+      break
+    case '/':
+      e.preventDefault()
+      hud.focusSearch()
+      break
+    case 'u':
+    case 'U':
+      actions.undoArchive()
       break
     case '0':
       actions.resetView()
@@ -544,6 +683,10 @@ window.addEventListener('keydown', (e) => {
     case 'a':
     case 'A':
       if (selectedId) actions.archiveThread()
+      break
+    case 'r':
+    case 'R':
+      if (selectedId) actions.retryThread()
       break
     case 'v':
     case 'V':
@@ -581,12 +724,6 @@ window.addEventListener('keydown', (e) => {
     case '_':
       rig.desiredDistance = Math.min(150, rig.desiredDistance * 1.22)
       break
-    // One step at a time, outward: the thread, then the zone it belongs to.
-    case 'Escape':
-      if (document.querySelector('.help.open')) hud.toggleHelp(false)
-      else if (selectedId) select(null, {})
-      else if (selectedProject) actions.closeProject()
-      break
   }
 })
 
@@ -618,15 +755,60 @@ function applyThreads(list) {
   if (firstSeen) queueSave()
 
   const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
-  hud.setStats(stats)
+
+  // How much of the roster is actually on the island. Over the crew cap or a zone's slots the
+  // rest have no builder, and a map that silently shows 84 of 445 reads as the whole truth.
+  //
+  // Three numbers that used to disagree: the "builders" counter said 79 while this line said 76
+  // of 387. The counter was counting every thread that survived the dormant rule — 79 — and the
+  // line was counting who actually has a builder, three of which were over a zone's slots. The
+  // counter now reports the drawn ones, and this line splits the rest into the two reasons.
+  const now = Date.now()
+  let drawnCount = 0
+  let dormant = 0
+  let over = 0
+  for (const t of colony.threads.values()) {
+    if (colony.astronauts.isDrawn(t.id)) drawnCount++
+    else if (statusFor(t, now) === 'sleeping') dormant++
+    else over++
+  }
+  hud.setStats({ ...stats, agents: drawnCount })
+  hud.setCoverage({ shown: drawnCount, total: colony.threads.size, dormant, over })
+
+  // Everything findable, drawn or not: the search box looks through all of it.
+  hud.setDirectory(
+    [...colony.threads.values()].map((t) => ({
+      id: t.id,
+      title: t.title,
+      project: t.project,
+      harness: t.harness,
+      harnessName: t.harnessName,
+      lastActivityAt: t.lastActivityAt,
+      lastRunAt: t.lastRunAt,
+      status: statusFor(t, now),
+      drawn: colony.astronauts.isDrawn(t.id),
+    }))
+  )
+  hud.setArchived(
+    state.archived
+      .map((id) => {
+        const t = list.find((x) => x.id === id)
+        return { id, title: t ? titleOf(t) : id.replace(/^[^:]+:/, ''), project: t?.project || '', at: state.archivedAt?.[id] || 0 }
+      })
+      .sort((a, b) => b.at - a.at)
+  )
 
   legendProjects = colony.plotOrder
-    .map((plot) => ({
-      name: plot.name,
-      accent: plot.accent,
-      count: list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name).length,
-      urgent: colony.urgentPlots?.has(plot.id) ?? false,
-    }))
+    .map((plot) => {
+      const mine = list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name)
+      return {
+        name: plot.name,
+        accent: plot.accent,
+        count: mine.length,
+        drawn: mine.filter((t) => colony.astronauts.isDrawn(t.id)).length,
+        urgent: colony.urgentPlots?.has(plot.id) ?? false,
+      }
+    })
     .sort((a, b) => b.count - a.count)
 
   // Keep the card honest if the thread it is showing changed underneath it.
@@ -650,17 +832,37 @@ function applyThreads(list) {
 }
 
 let polling = false
-async function poll() {
+async function poll({ force = false } = {}) {
+  // A hidden tab has nobody to show it to, and a scan of four hundred workflows is not free on
+  // the server. The visibility handler polls the moment the tab is back.
+  if (document.hidden && !force) return
   if (polling) return
   polling = true
   try {
     const res = await fetchThreads()
     applyThreads(res.threads || [])
+    // `warnings` are the harnesses that could not be read, and `scannedAt` is when the server
+    // last looked: both used to be thrown away, so a harness that stopped answering left the
+    // map frozen at its last roster with nothing on screen to say so.
+    hud.setHealth({
+      ok: true,
+      warnings: res.warnings || [],
+      scannedAt: Number(res.scannedAt) || Date.now(),
+      stale: (res.threads || []).some((t) => t.staleSince),
+    })
+    // The first roster is when the real work starts — every builder walking off the boat at
+    // once — so that is when the quality governor's grace period should start, not at mount.
+    if (document.querySelector('.boot')) engine.warmUp()
     hud.removeBoot()
   } catch (err) {
+    // Stays on screen, unlike the toast: the old picture is still up, and what it needs is a
+    // standing note that it is old.
+    hud.setHealth({ ok: false, error: err.message || 'Could not reach the thread scanner' })
     hud.toast(err.message || 'Could not reach the thread scanner', 'err')
     hud.removeBoot()
   } finally {
+    // Unconditionally, and the fetch has a deadline, so this is reached even when the server
+    // accepts the request and never answers.
     polling = false
   }
 }
@@ -708,19 +910,27 @@ async function boot() {
   colony.astronauts.setRig(crewRig())
   if (!kitError) colony.onAssetsReady()
 
-  await poll()
-  setInterval(poll, POLL_MS)
-  window.addEventListener('focus', poll)
+  await poll({ force: true })
+  setInterval(() => poll(), POLL_MS)
+  window.addEventListener('focus', () => poll())
   // A tab that was hidden for an hour should catch up the moment it comes back.
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) poll()
   })
 
-  if (!localStorage.getItem('botcrossing.seen-help')) {
+  // The old key is honoured so a browser that has seen the sheet before is not shown it again.
+  // Storage can be blocked or throw (private windows, cleared site data); then the sheet is simply shown.
+  let seenHelp = false
+  try {
+    seenHelp = Boolean(localStorage.getItem('botsbay.seen-help') || localStorage.getItem('botcrossing.seen-help'))
+    if (!seenHelp) localStorage.setItem('botsbay.seen-help', '1')
+  } catch {
+    /* the sheet comes back next time, which beats not opening at all */
+  }
+  if (!seenHelp) {
     hud.toggleHelp(true)
-    localStorage.setItem('botcrossing.seen-help', '1')
   } else {
-    hud.hint('Drag to move · click an astronaut · H hides everything', 5200)
+    hud.hint('Drag to move · click a builder · H hides everything', 5200)
   }
 }
 
@@ -737,6 +947,10 @@ settings.onChange((changed, scope) => {
   if (changed.has('showFps')) hud.syncSettings()
   // Folding dormant repos away changes which threads are on the map, so the colony has to be
   // rebuilt from the list rather than merely re-rendered.
+  // A new world can mean a new zone palette, so the plots have to be rebuilt rather than
+  // merely re-lit — and waiting for the next poll to do it would leave the old colours up
+  // for as long as fifteen seconds.
+  if (changed.has('planet')) applyThreads(threads)
   if (changed.has('hideDormant')) applyThreads(threads)
   if (changed.has('maxAgents')) applyThreads(threads)
 })
@@ -757,15 +971,16 @@ engine.add({
       if (!agent) select(null, {})
       else hud.placeCard(screenOf(agent))
     }
-    hud.setFps(engine.perf, engine.viewport, `${colony.astronauts.visibleCount} crew · ${colony.particles.liveCount} bits`)
+    hud.setFps(engine.perf, engine.viewport, `${colony.astronauts.visibleCount} builders · ${colony.particles.liveCount} bits`)
   },
 })
 
 engine.start()
 boot()
 
-// Handy for poking at the running colony from the console.
-window.botCrossing = { engine, rig, colony, settings, hud, poll, get threads() { return threads } }
+// Handy for poking at the running island from the console. The old name still answers.
+window.botsBay = { engine, rig, colony, settings, hud, poll: () => poll({ force: true }), get threads() { return threads } }
+window.botCrossing = window.botsBay
 
 /** `execCommand('copy')` over a throwaway textarea — the copy that predates permissions. */
 function copyFallback(text) {

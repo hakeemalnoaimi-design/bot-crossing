@@ -33,7 +33,7 @@ written down here.
 
 ## What is most worth contributing
 
-**Harness adapters, by a wide margin.** Bot Crossing reads Claude Code and Codex. The whole
+**Harness adapters, by a wide margin.** BotsBay World reads Claude Code, Codex, Cursor and n8n. The whole
 point of the seam in `server/harnesses/` is that adding OpenCode, Antigravity, Amp, Cursor or
 anything else should be one new file and one line in a registry.
 
@@ -59,7 +59,7 @@ interface than have you contort an adapter around it.
 
 Also useful:
 
-- **Bug fixes**, especially anything where the colony misrepresents what a thread is actually
+- **Bug fixes**, especially anything where the island misrepresents what a thread is actually
   doing. That is the one thing the project has to get right.
 - **Performance**, if you can measure it. See the Performance section of the README for the kind
   of numbers the existing work is held to.
@@ -77,7 +77,7 @@ You need a real harness installed with real threads for anything interesting to 
 because the built files are checked in and the raw packs are not. You only need it if you are
 changing the art pipeline, and the README explains where to re-download the packs.
 
-`npm test` runs the suite — the colony file's merge and migration, and the harness contract
+`npm test` runs the suite — the island file's merge and migration, and the harness contract
 against fixtures. It is not exhaustive and there is no linter. New tests are welcome but not
 demanded; keeping the existing ones green is.
 

@@ -77,7 +77,7 @@ export async function scanThreads() {
         const threads = await h.scanThreads()
         return threads.map((t) => ({ ...t, harness: h.id, harnessName: h.name }))
       } catch (err) {
-        console.warn(`bot-crossing: harness "${h.id}" failed to scan —`, err?.message || err)
+        console.warn(`botsbay-world: harness "${h.id}" failed to scan —`, err?.message || err)
         return []
       }
     })
@@ -110,7 +110,7 @@ export async function defaultHarness() {
 
 const dispatch = (harnessId) => {
   const h = harnessById(harnessId)
-  if (!h) throw new Error(`Unknown harness "${harnessId}"`)
+  if (!h) throw Object.assign(new Error(`Unknown harness "${harnessId}"`), { status: 400 })
   return h
 }
 
@@ -118,3 +118,21 @@ const dispatch = (harnessId) => {
 export const openThread = async (harnessId, ref) => dispatch(harnessId).openThread(ref)
 
 export const newSession = async (harnessId, dir) => dispatch(harnessId).newSession(dir)
+
+/**
+ * Ask a harness to run something again.
+ *
+ * Not every harness has the idea, and most never will — a thread of yours is not something
+ * this can re-run. An adapter that does offers `retry`, and marks the individual threads it
+ * applies to with `canRetry`; everything else answers honestly that it cannot.
+ *
+ * This is the only path in the project that changes anything in a harness. It is here rather
+ * than folded into `openThread` so that it is one named, greppable thing.
+ */
+export const retryThread = async (harnessId, ref) => {
+  const harness = dispatch(harnessId)
+  if (typeof harness.retry !== 'function') {
+    return { ok: false, error: `${harness.name} has nothing to retry` }
+  }
+  return harness.retry(ref)
+}

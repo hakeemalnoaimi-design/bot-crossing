@@ -20,21 +20,31 @@ const TYPES = {
   '.woff2': 'font/woff2',
 }
 
-/** Resolve inside dist/ only — a request can never climb out with `..`. */
+/**
+ * Resolve inside dist/ only — a request can never climb out with `..`.
+ * `null` for a path that escapes; throws URIError for a malformed escape like `%E0%A4%A`, which
+ * the caller turns into a 400.
+ */
 function resolveInDist(pathname) {
   const rel = decodeURIComponent(pathname).replace(/^\/+/, '')
   const file = path.resolve(DIST, rel || 'index.html')
   return file === DIST || file.startsWith(DIST + path.sep) ? file : null
 }
 
-const server = http.createServer(async (req, res) => {
+async function serveRequest(req, res) {
   const url = new URL(req.url, 'http://localhost')
 
   if (url.pathname.startsWith('/api/')) {
     return apiMiddleware(req, res, null)
   }
 
-  let file = resolveInDist(url.pathname)
+  let file
+  try {
+    file = resolveInDist(url.pathname)
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' }).end('Bad request')
+    return
+  }
   if (!file) {
     res.writeHead(403).end('Forbidden')
     return
@@ -56,8 +66,26 @@ const server = http.createServer(async (req, res) => {
   } catch {
     res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found')
   }
-})
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`Bot Crossing → http://${HOST}:${PORT}`)
-})
+/**
+ * The whole handler sits behind one catch. An async handler that throws is an unhandled
+ * rejection, and Node's default for those is to exit — one bad request line taking the server
+ * down for everyone. Whatever goes wrong becomes a 500, or just a closed socket if the reply
+ * had already started.
+ */
+export async function handler(req, res) {
+  try {
+    await serveRequest(req, res)
+  } catch {
+    if (res.headersSent) return void res.end()
+    res.writeHead(500, { 'Content-Type': 'text/plain' }).end('Server error')
+  }
+}
+
+// Importable for tests without opening a port; `npm run serve` is the only thing that listens.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  http.createServer(handler).listen(PORT, HOST, () => {
+    console.log(`BotsBay World → http://${HOST}:${PORT}`)
+  })
+}

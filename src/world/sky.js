@@ -18,6 +18,10 @@ const SKY_VERT = /* glsl */ `
     // The dome is pinned to the camera, so it can never be walked out of.
     vec4 mv = modelViewMatrix * vec4( position, 1.0 );
     gl_Position = projectionMatrix * mv;
+    // Pushed to the far plane, a hair inside it, so that wherever anything at all has
+    // already been drawn the depth test throws the sky away before it is shaded. The dome
+    // is drawn last for exactly that reason — see \`_buildDome\`.
+    gl_Position.z = gl_Position.w * 0.999999;
   }
 `
 
@@ -57,15 +61,6 @@ const SKY_FRAG = /* glsl */ `
 `
 
 /** Named times of day. The slider is continuous; these are just the good stops. */
-/**
- * This machine's wall clock as a day fraction — 0 is midnight, 0.5 is noon, which is exactly
- * what `timeOfDay` means. Local time on purpose: the point is that the colony's light matches
- * the light out of your own window, so UTC would be the wrong answer nearly everywhere.
- */
-export function systemTimeOfDay(now = new Date()) {
-  return (now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400
-}
-
 export const TIMES = [
   { id: 'dawn', label: 'Dawn', value: 0.255 },
   { id: 'morning', label: 'Morning', value: 0.34 },
@@ -74,6 +69,99 @@ export const TIMES = [
   { id: 'dusk', label: 'Dusk', value: 0.755 },
   { id: 'night', label: 'Night', value: 0.94 },
 ]
+
+/**
+ * The clock the colony runs on. Not the machine's: BotsBay is in Bahrain, the agents on this
+ * map are working Bahrain hours, and a laptop opened in another timezone should still show
+ * the light the office is actually standing in.
+ *
+ * `Intl.DateTimeFormat` is what does the conversion, offsets and all — deriving it by hand
+ * from `getTimezoneOffset` gets Gulf Standard Time right and every timezone with a summer
+ * clock wrong, and the browser already ships the whole database.
+ */
+export const WORLD_TIMEZONE = 'Asia/Bahrain'
+
+const zoneClock = new Intl.DateTimeFormat('en-GB', {
+  timeZone: WORLD_TIMEZONE,
+  hour12: false,
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+})
+
+/**
+ * Wall clock in Bahrain, as minutes since midnight. `hourCycle` is left alone and `hour12`
+ * turned off, which gives 00–23 in `en-GB`; the 24 that some locales return for midnight is
+ * folded back to 0 rather than being trusted to be 0 already.
+ */
+function zoneMinuteOfDay(now) {
+  const parts = zoneClock.formatToParts(now)
+  const at = (type) => Number(parts.find((p) => p.type === type)?.value ?? 0)
+  return (at('hour') % 24) * 60 + at('minute') + at('second') / 60
+}
+
+/**
+ * Where the named times of day actually fall in Bahrain, as `[wall clock, timeOfDay]`.
+ *
+ * A straight `seconds / 86400` would be defensible on a planet and is wrong on a real one:
+ * it puts the sun down at 22:30, so the world is still bright through the evening and the
+ * lights come on around bedtime. Anchoring the four times that matter and interpolating
+ * between them keeps the middle of the day linear while pinning sunset where the Gulf
+ * actually has it.
+ *
+ * The gap from night back round to dawn carries the whole night, and is why the table wraps
+ * rather than clamping — the interpolation crosses midnight in both columns at once.
+ *
+ * Both this table and the function below work in whole minutes since midnight rather than in
+ * fractions of a day, so that an anchor is a value the search lands on exactly. Through a
+ * fraction it is not: `1065 / 1440 * 1440` is `1064.9999999999998`, and 17:45 then misses
+ * dusk by 4e-16 — the same answer to fifteen decimal places, and a boundary that reads as
+ * broken to anyone who tests the spec it was written from.
+ */
+const DAY_MINUTES = 24 * 60
+const CLOCK_ANCHORS = [
+  [5 * 60 + 30, 0.255], // 05:30 — dawn
+  [12 * 60, 0.5], // 12:00 — noon
+  [17 * 60 + 45, 0.755], // 17:45 — dusk
+  [19 * 60 + 30, 0.94], // 19:30 — night
+]
+
+/**
+ * Piecewise-linear through `CLOCK_ANCHORS`, wrapping through midnight.
+ * Minutes since midnight in, `timeOfDay` 0..1 out.
+ */
+export function timeOfDayForMinute(minuteOfDay) {
+  const day = ((minuteOfDay % DAY_MINUTES) + DAY_MINUTES) % DAY_MINUTES
+  // Before the first anchor is the tail of the previous night, which the wrapped final
+  // segment covers — so it is looked up a day later rather than clamped to dawn.
+  const minute = day < CLOCK_ANCHORS[0][0] ? day + DAY_MINUTES : day
+  for (let i = 0; i < CLOCK_ANCHORS.length; i++) {
+    const [fromClock, fromValue] = CLOCK_ANCHORS[i]
+    const last = i === CLOCK_ANCHORS.length - 1
+    // The final segment runs to the first anchor of the next day, so both columns advance
+    // by a whole turn rather than folding back on themselves.
+    const [nextClock, nextValue] = last ? CLOCK_ANCHORS[0] : CLOCK_ANCHORS[i + 1]
+    const toClock = last ? nextClock + DAY_MINUTES : nextClock
+    const toValue = last ? nextValue + 1 : nextValue
+    if (minute < fromClock || minute > toClock) continue
+    const t = (minute - fromClock) / (toClock - fromClock)
+    // Exact on the anchors themselves. `from + 1 * (to - from)` is not `to` in floating
+    // point, and these four instants are the specification rather than a curve through it —
+    // 05:30 has to *be* dawn, not dawn plus 5e-17.
+    if (t === 0) return fromValue % 1
+    if (t === 1) return toValue % 1
+    return (fromValue + t * (toValue - fromValue)) % 1
+  }
+  return CLOCK_ANCHORS[0][1]
+}
+
+/**
+ * Bahrain's wall clock as a `timeOfDay` — 0 is midnight, 0.5 is noon, which is what the
+ * sky's own `time` means.
+ */
+export function systemTimeOfDay(now = new Date()) {
+  return timeOfDayForMinute(zoneMinuteOfDay(now))
+}
 
 const SUN_AXIS = 0.72 // which way the sun tracks across the sky
 /**
@@ -90,11 +178,23 @@ const SUN_APEX = 0.95
 /** Half-width of the shadow camera, in metres, centred on whatever you are looking at. */
 const SHADOW_EXTENT = 30
 /**
+ * Where the moon hangs, and so where its light comes from after dark. The same direction
+ * the companion body is parked in, so the light and the thing casting it agree.
+ */
+const MOON_DIR = new THREE.Vector3(-0.55, 0.5, -0.66).normalize()
+/** Moonlight for a world that does not name its own: cool, and about a fifth of a sun. */
+const DEFAULT_MOONLIGHT = { color: 0x9fb3d9, intensity: 0.45 }
+/** What a world that says nothing about its night keeps: the old third of the day's hemisphere. */
+const DEFAULT_NIGHT_FILL = { hemi: 0.3, env: 1 }
+/**
  * The focus is snapped to this grid before the shadow camera moves. Panning a shadow map
  * by sub-texel amounts makes every shadow edge crawl; snapping trades a little slack at
  * the frustum edge for edges that hold still.
  */
 const SHADOW_SNAP = 2
+
+/** How often the sky re-reads the wall clock while following it. */
+const CLOCK_INTERVAL_MS = 60_000
 
 export class Sky {
   constructor(scene, settings, renderer) {
@@ -106,6 +206,10 @@ export class Sky {
     scene.add(this.group)
 
     this.sunDir = new THREE.Vector3(0, 1, 0)
+    /** Where the key light actually shines from: the sun by day, the moon by night. */
+    this.keyDir = new THREE.Vector3(0, 1, 0)
+    /** When the wall clock was last read. Zero means "on the next frame". */
+    this._clockAt = 0
     this.dayFactor = 1
     this._c1 = new THREE.Color()
     this._c2 = new THREE.Color()
@@ -143,6 +247,17 @@ export class Sky {
     this._envDirty = true
     this._envAt = 0
     this._envTarget = null
+    // A lost context empties the prefiltered map and the generator's own scratch targets.
+    // The engine cannot reach in here, so the sky listens for the same event it does and
+    // starts over: a fresh generator, and the environment drawn again on the next frame.
+    // Without it every metal and every dielectric lost its sky and the island went flat.
+    this.renderer.domElement.addEventListener('webglcontextrestored', () => {
+      this.pmrem.dispose()
+      this.pmrem = new THREE.PMREMGenerator(this.renderer)
+      this._envTarget = null
+      this._envDirty = true
+      this._envAt = 0
+    })
   }
 
   _refreshEnvironment(force = false) {
@@ -164,7 +279,7 @@ export class Sky {
     this._envTarget?.dispose()
     this._envTarget = next
     this.scene.environment = next.texture
-    this.scene.environmentIntensity = this.settings.get('iblIntensity')
+    this.scene.environmentIntensity = this.settings.get('iblIntensity') * (this._nightEnv ?? 1)
   }
 
   _buildDome() {
@@ -184,11 +299,18 @@ export class Sky {
       fragmentShader: SKY_FRAG,
       side: THREE.BackSide,
       depthWrite: false,
-      depthTest: false,
+      // Tested against the depth buffer, and drawn *after* every other opaque thing rather
+      // than first. The old order — sky first, with the test off — shaded the whole frame
+      // as sky and then painted the ground over most of it, which on an integrated GPU was
+      // a measurable slice of every frame spent on pixels nobody ever saw. Drawn last, with
+      // its depth pushed to the far plane in the vertex stage, only the sky that is actually
+      // visible gets shaded. Stars, the moon's halo and every label are transparent, so they
+      // still land on top of it.
+      depthTest: true,
       fog: false,
     })
     this.dome = new THREE.Mesh(geo, mat)
-    this.dome.renderOrder = -1000
+    this.dome.renderOrder = 900
     this.dome.frustumCulled = false
     this.dome.scale.setScalar(400)
     this.group.add(this.dome)
@@ -214,6 +336,10 @@ export class Sky {
     // peter-panning that a negative depth bias causes on these small characters.
     this.sun.shadow.bias = 0
     this.sun.shadow.normalBias = 0.09
+    // A couple of texels of blur on the edge. The sampler dithers a small disc per pixel,
+    // so this is what turns a hard-edged shadow with stair-steps into a soft one — and at
+    // this radius the dither reads as softness rather than as grain.
+    this.sun.shadow.radius = 2.2
     this.sun.shadow.mapSize.setScalar(this.settings.shadowSize || 1024)
     this.focus = new THREE.Vector3()
     this.sun.target.position.set(0, 0, 0)
@@ -222,10 +348,11 @@ export class Sky {
     this.hemi = new THREE.HemisphereLight(0x8899cc, 0x4a4038, 0.6)
     this.group.add(this.hemi)
 
-    // A cool rim from the opposite side keeps night silhouettes from going fully black.
-    this.fill = new THREE.DirectionalLight(0x8fa8d8, 0.2)
-    this.fill.position.set(-40, 30, -30)
-    this.group.add(this.fill)
+    // One directional light, not two. There used to be a second, a cool fill from nowhere
+    // in particular, to keep night silhouettes from going black — and every lit pixel on
+    // screen paid for a second full lighting evaluation, all day long, for it. Night has a
+    // key of its own now: the moon, see `setTime`. The sky's own environment map and the
+    // hemisphere light carry the fill.
   }
 
   _buildStars() {
@@ -344,10 +471,19 @@ export class Sky {
     this.dayTop = new THREE.Color(planet.sky.top)
     this.dayBottom = new THREE.Color(planet.sky.bottom)
     // Night is the day palette crushed toward the planet's own horizon colour, so each
-    // world keeps its identity after dark instead of all three going the same black.
-    this.nightTop = new THREE.Color(planet.sky.top).multiplyScalar(0.16).lerp(new THREE.Color(0x03040c), 0.7)
-    this.nightBottom = new THREE.Color(planet.horizon).multiplyScalar(0.5)
-    this.duskColor = new THREE.Color(planet.atmosphere > 0.4 ? 0xd4692f : 0x4a3550)
+    // world keeps its identity after dark instead of all of them going the same black.
+    // A world may also spell its night out — `night` on the preset wins where it exists,
+    // which is how Bahrain gets an indigo sky over a deep Gulf blue waterline rather than
+    // a dimmer copy of its own noon.
+    this.nightTop = planet.night
+      ? new THREE.Color(planet.night.top)
+      : new THREE.Color(planet.sky.top).multiplyScalar(0.16).lerp(new THREE.Color(0x03040c), 0.7)
+    this.nightBottom = planet.night
+      ? new THREE.Color(planet.night.horizon)
+      : new THREE.Color(planet.horizon).multiplyScalar(0.5)
+    // What a low sun bleeds into. The atmosphere rule is the fallback; a world with an
+    // opinion about its own sunsets states it.
+    this.duskColor = new THREE.Color(planet.dusk ?? (planet.atmosphere > 0.4 ? 0xd4692f : 0x4a3550))
 
     const comp = planet.companion
     this.companionBody.material.color.set(comp.color)
@@ -377,9 +513,9 @@ export class Sky {
     this._placeSun()
   }
 
-  /** Sun position and target both hang off the focus point, so the frustum travels with it. */
+  /** Key light and target both hang off the focus point, so the frustum travels with it. */
   _placeSun() {
-    this.sun.position.copy(this.sunDir).multiplyScalar(150).add(this.focus)
+    this.sun.position.copy(this.keyDir).multiplyScalar(150).add(this.focus)
     this.sun.target.position.copy(this.focus)
     this.sun.target.updateMatrixWorld()
   }
@@ -412,8 +548,18 @@ export class Sky {
 
     // Sun light: warm and weak at the horizon, full and neutral overhead.
     const sunColor = this._c1.set(planet.sun.color).lerp(this.duskColor, golden * 0.7 * planet.atmosphere)
-    this.sun.color.copy(sunColor)
-    this.sun.intensity = THREE.MathUtils.lerp(planet.sun.night, planet.sun.intensity, day)
+
+    // The key light is the sun by day and the moon after dark, one directional light either
+    // way. Night used to keep the sun on at a tenth of its strength — shining *up* from
+    // under the ground, since that is where the sun is at night — and lean on a second
+    // light to hide it. Handing the key to the moon gives the night a key direction of its
+    // own: long, soft shadows the other way, and water with a moon on it. Blended through
+    // dusk, so the shadows swing round rather than snapping.
+    const moon = planet.moonlight || DEFAULT_MOONLIGHT
+    const toSun = THREE.MathUtils.smoothstep(day, 0.05, 0.6)
+    this.keyDir.copy(MOON_DIR).lerp(this.sunDir, toSun).normalize()
+    this.sun.color.copy(this._c2.set(moon.color).lerp(sunColor, toSun))
+    this.sun.intensity = THREE.MathUtils.lerp(moon.intensity, planet.sun.intensity, day)
     this._placeSun()
 
     this.hemi.color.set(planet.ambient.sky)
@@ -421,10 +567,13 @@ export class Sky {
     // The hemisphere light drops right back when IBL is carrying the ambient — running both
     // at full strength double-counts the sky and flattens everything out.
     const hemiScale = this.settings.get('ibl') ? 0.55 : 1
-    this.hemi.intensity = THREE.MathUtils.lerp(planet.ambient.intensity * 0.22, planet.ambient.intensity, day) * hemiScale
-    // Enough of a bounce that surfaces turned away from the sun read as dark rather than as
-    // holes in the image. On an airless world this stands in for regolith bounce.
-    this.fill.intensity = THREE.MathUtils.lerp(0.34, 0.26, day)
+    const fill = planet.nightFill || DEFAULT_NIGHT_FILL
+    this.hemi.intensity = THREE.MathUtils.lerp(planet.ambient.intensity * fill.hemi, planet.ambient.intensity, day) * hemiScale
+    // The sky reflections are dim after dark by construction — the night dome is a few
+    // percent of the day's — so a world that wants a readable night lifts them here, fading
+    // back to the setting's own value as the sun comes up.
+    this._nightEnv = THREE.MathUtils.lerp(fill.env, 1, day)
+    this.scene.environmentIntensity = this.settings.get('iblIntensity') * this._nightEnv
 
     // Sky gradient.
     const top = this._c1.copy(this.nightTop).lerp(this.dayTop, day)
@@ -446,7 +595,10 @@ export class Sky {
     this.companionBody.material.emissiveIntensity = 0.25 + (1 - day) * 0.55
 
     // Fog follows the horizon, or the whole world looks like it is behind glass at night.
-    this.scene.fog.color.copy(bottom).lerp(this._c1.set(planet.fog.color), 0.55)
+    // By day it leans toward the world's own haze colour; after dark it is the night sky's
+    // horizon and nothing else — a sand-coloured fog at midnight painted a bright band
+    // across the far ground under an indigo sky, which is what this used to do.
+    this.scene.fog.color.copy(bottom).lerp(this._c1.set(planet.fog.color), 0.55 * day)
     this._envDirty = true
   }
 
@@ -460,9 +612,12 @@ export class Sky {
         this.sun.shadow.map = null
       }
     }
+    // Re-enabling the clock jumps to it now rather than whenever the minute happens to
+    // be up, which would otherwise leave the sky wherever the scrubber was dropped.
+    if (changed.has('clockTime')) this._clockAt = 0
     if (changed.has('stars')) this.setTime(this.time)
     if (changed.has('ibl') || changed.has('iblIntensity')) {
-      this.scene.environmentIntensity = this.settings.get('iblIntensity')
+      this.scene.environmentIntensity = this.settings.get('iblIntensity') * (this._nightEnv ?? 1)
       this._refreshEnvironment(true)
     }
   }
@@ -477,10 +632,17 @@ export class Sky {
     this._refreshEnvironment()
 
     // Following the clock beats cycling: both drive the same value, and a cycle running on
-    // top of it would just fight. Re-read every frame rather than on a timer — it is two
-    // divisions, and it means crossing midnight or the machine waking from sleep needs no
-    // special case.
+    // top of it would just fight.
+    //
+    // Once a minute, not once a frame. A minute of Bahrain moves the light by well under
+    // what anyone can see between two frames, and the read is a timezone conversion rather
+    // than the two divisions it used to be. The gate is on the wall clock rather than an
+    // accumulated dt, so a machine coming back from sleep re-reads on its first frame
+    // instead of an hour late — which also covers crossing midnight for free.
     if (this.settings.get('clockTime')) {
+      const now = Date.now()
+      if (now - this._clockAt < CLOCK_INTERVAL_MS) return false
+      this._clockAt = now
       const t = systemTimeOfDay()
       if (Math.abs(t - this.time) < 1e-5) return false
       this.setTime(t)

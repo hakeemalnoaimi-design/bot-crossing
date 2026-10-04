@@ -1,0 +1,30 @@
+# Tests and a production build on every push and pull request.
+#
+# `npm run smoke` is not here: it draws real frames on a GPU and reads the pixels back, and a
+# CI runner has no GPU worth the name. It stays a manual gate after any renderer change.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build

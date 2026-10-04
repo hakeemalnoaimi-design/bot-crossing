@@ -43,6 +43,8 @@ export const FACE_LOOPS = {
   waiting: [FACE.wait, FACE.wait, FACE.alert, FACE.wait],
   broken: [FACE.error, FACE.error, FACE.sad, FACE.error],
   sleeping: [FACE.sleep],
+  /** Two idle builders mid-conversation. */
+  talking: [FACE.happy, FACE.idle, FACE.happy, FACE.idle, FACE.wink],
 }
 
 export function buildFaceAtlas(size = 512) {

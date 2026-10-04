@@ -1,12 +1,11 @@
 {
-  "name": "bot-crossing",
+  "name": "botsbay-world",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A 3D colony sim where every coding-agent thread on your machine is a little astronaut building something.",
+  "description": "BotsBay World: a live 3D island where every AI agent working for BotsBay is a little builder at work. A fork of Bot Crossing.",
   "license": "MIT",
   "author": "Jarren Rocks",
-  "homepage": "https://botcrossing.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jarrenrocks/bot-crossing.git"
@@ -37,6 +36,9 @@
     "start": "vite build && node server/serve.mjs",
     "serve": "node server/serve.mjs",
     "assets": "node tools/build-assets.mjs",
+    "profile": "node tools/profile.mjs",
+    "shot": "node tools/shot.mjs",
+    "smoke": "node tools/smoke.mjs",
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {

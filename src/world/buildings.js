@@ -29,9 +29,12 @@ import { ATLAS, CELL, atlasTexture, cellMask, part } from './kit.js'
  *    even though both arrive as flat colour in a single texture.
  */
 
-/** Shared across every building, so night falling is one uniform write for the whole colony. */
+/**
+ * Shared across every building. Night is deliberately *not* in here any more: each building
+ * lights up at a moment of its own (`uLit`, set per building from `lightsAt`), so the
+ * windows come on one at a time through the evening rather than all fading up together.
+ */
 export const buildingUniforms = {
-  uNight: { value: 0 },
   /** Seconds, for anything that turns. One write drives every rotor in the colony. */
   uTime: { value: 0 },
 }
@@ -275,6 +278,8 @@ function decorate(material, uniforms) {
          varying float vEmissive;
          varying vec2 vAtlasUv;
          varying float vLocalY;
+         varying vec2 vLocalXZ;
+         varying float vLocalNY;
          uniform float uProgress;
          uniform float uMaxY;
          uniform float uMinY;
@@ -292,7 +297,8 @@ function decorate(material, uniforms) {
       .replace(
         '#include <beginnormal_vertex>',
         `#include <beginnormal_vertex>
-         if ( aSpin > 0.0 ) objectNormal = botSpin( objectNormal, vec3( 0.0 ), uTime * aSpin );`
+         if ( aSpin > 0.0 ) objectNormal = botSpin( objectNormal, vec3( 0.0 ), uTime * aSpin );
+         vLocalNY = objectNormal.y;`
       )
       .replace(
         '#include <begin_vertex>',
@@ -305,6 +311,7 @@ function decorate(material, uniforms) {
          // Measured *after* the rotor has turned, so a blade sweeping past the ground line
          // is revealed and hidden by the same rule as everything else.
          vLocalY = transformed.y;
+         vLocalXZ = transformed.xz;
          // The whole structure is lowered into the ground, and the fragment stage throws
          // away whatever ends up below the deck. What is on screen is therefore always a
          // *complete* building, part of it buried — never a sliced one.
@@ -318,11 +325,13 @@ function decorate(material, uniforms) {
          varying float vEmissive;
          varying vec2 vAtlasUv;
          varying float vLocalY;
+         varying vec2 vLocalXZ;
+         varying float vLocalNY;
          uniform float uProgress;
          uniform float uMaxY;
          uniform float uMinY;
          uniform vec3 uAccent;
-         uniform float uNight;
+         uniform float uLit;
          uniform float uCellAccent[ ${CELL_COUNT} ];
          uniform float uCellRoughness[ ${CELL_COUNT} ];
          uniform float uCellMetalness[ ${CELL_COUNT} ];
@@ -343,7 +352,12 @@ function decorate(material, uniforms) {
          // would cut them off a building that is otherwise finished.
          float ground = uMinY + ( 1.0 - uProgress ) * ( uMaxY - uMinY );
          if ( vLocalY < ground - 0.001 ) discard;
-         int cell = atlasCell();`
+         int cell = atlasCell();
+         // A contact shadow where the structure meets the deck: the lowest half-unit of
+         // every building shades toward the ground it stands on. The shadow map cannot
+         // draw this — at a texel every six centimetres the crease under a wall is lost —
+         // and it is most of what makes a building look set down rather than placed.
+         float footAO = 1.0 - 0.28 * ( 1.0 - smoothstep( 0.0, 0.55, vLocalY - ground ) );`
       )
       // The accent repaint. Luminance carries the swatch's own gradient across, so the trim
       // keeps its shading instead of going flat the moment it changes colour.
@@ -353,8 +367,9 @@ function decorate(material, uniforms) {
          float accentAmount = uCellAccent[ cell ];
          if ( accentAmount > 0.0 ) {
            float lum = dot( diffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
-           diffuseColor.rgb = mix( diffuseColor.rgb, uAccent * clamp( lum * 1.9, 0.3, 1.5 ), accentAmount );
-         }`
+           diffuseColor.rgb = mix( diffuseColor.rgb, uAccent * clamp( lum * 1.9, 0.3, 1.1 ), accentAmount );
+         }
+         diffuseColor.rgb *= footAO;`
       )
       // Per-cell PBR: painted panels, brushed metal and photovoltaic glass in one texture.
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = uCellRoughness[ cell ];')
@@ -363,9 +378,28 @@ function decorate(material, uniforms) {
         '#include <emissivemap_fragment>',
         `#include <emissivemap_fragment>
          // Lamps and beacons, flagged per vertex when the recipe placed them.
-         totalEmissiveRadiance += diffuseColor.rgb * vEmissive * ( 0.25 + uNight * 2.4 );
-         // Window strips and trim come on after dark, in the repo's own colour.
-         totalEmissiveRadiance += uAccent * uCellAccent[ cell ] * uNight * 1.15;
+         totalEmissiveRadiance += diffuseColor.rgb * vEmissive * ( 0.25 + uLit * 2.4 );
+         // Window strips come on in the evening — at this building's own moment, see
+         // \`lightsAt\` — in the repo's colour pulled toward lamplight.
+         //
+         // The accent swatch is not a window. On the kit it is a whole wall band, and on a
+         // dome most of the visible surface, so adding emission to every fragment of it lit
+         // each band as one flat, unshaded, hard-edged slab: at night the pearl accent read as
+         // clipped cream with no form left in it, whatever the exposure. A window is a short
+         // lit pane with dark wall between it and the next, so the emission is broken into
+         // panes along the wall (the two weights are off the octagon's 45-degree edges, so no
+         // face is left with a constant phase) and the rest of the band keeps its shading.
+         //
+         // They used to be ~0.2 units apart, which at any distance is a barcode. Now they are a
+         // row of windows: about half a unit wide with a clear gap of the same again between,
+         // in one band at a time up the wall, and only on the wall — the normal says whether this
+         // is a side or a curved roof, and a dome's crown gets no panes at all.
+         float along = fract( vLocalXZ.x * 0.9 + vLocalXZ.y * 0.55 );
+         float pane = smoothstep( 0.12, 0.17, along ) * ( 1.0 - smoothstep( 0.52, 0.57, along ) );
+         float row = smoothstep( 0.18, 0.24, fract( vLocalY * 0.8 + 0.1 ) ) * ( 1.0 - smoothstep( 0.62, 0.68, fract( vLocalY * 0.8 + 0.1 ) ) );
+         pane *= row * ( 1.0 - smoothstep( 0.2, 0.45, abs( vLocalNY ) ) );
+         vec3 lampTint = mix( uAccent, vec3( 1.0, 0.76, 0.46 ), 0.6 );
+         totalEmissiveRadiance += lampTint * uCellAccent[ cell ] * uLit * ( 0.03 + 0.9 * pane );
          // The construction line: a bright band riding just above the ground it rises from.
          float band = 1.0 - smoothstep( 0.0, 0.22, vLocalY - ground );
          totalEmissiveRadiance += uAccent * band * ( 1.0 - step( 0.999, uProgress ) ) * 1.5;`
@@ -467,7 +501,8 @@ export function createBuilding({ seed = 1, accent = 0xc96442, kind = null } = {}
     uMaxY: { value: height },
     uMinY: { value: geo.boundingBox.min.y },
     uAccent: { value: new THREE.Color(accent) },
-    uNight: buildingUniforms.uNight,
+    /** 0 by day, 1 once this building's lights are on. Written per frame by the colony. */
+    uLit: { value: 0 },
     uTime: buildingUniforms.uTime,
     uCellAccent: { value: ACCENT_MASK },
     uCellRoughness: { value: ROUGHNESS },
@@ -508,6 +543,10 @@ export function createBuilding({ seed = 1, accent = 0xc96442, kind = null } = {}
   mesh.userData.height = height
   mesh.userData.footprint = footprint
   mesh.userData.uniforms = uniforms
+  // When in the evening this building's windows come on, as a night factor: somewhere
+  // between golden hour and just after sunset, decided by the same seed as everything else
+  // about it, so it is the same building that is always first on its plot.
+  mesh.userData.lightsAt = 0.3 + (((seed >>> 4) % 1000) / 1000) * 0.4
   mesh.userData.progress = 1
   mesh.userData.setProgress = (p) => {
     const v = THREE.MathUtils.clamp(p, 0, 1)

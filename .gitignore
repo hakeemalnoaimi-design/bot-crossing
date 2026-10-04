@@ -6,6 +6,11 @@ dist
 data/*.json
 data/*.tmp
 
+# Secrets for the networked harnesses — API keys and instance URLs. `.env.example` is the
+# checked-in template; this is never committed and never reaches the browser.
+.env
+.env.local
+
 # Per-machine Claude Code permissions — personal paths live in here.
 .claude/settings.local.json
 
@@ -18,3 +23,4 @@ assets-src
 
 # Local capture output — not part of the project.
 recordings
+shots

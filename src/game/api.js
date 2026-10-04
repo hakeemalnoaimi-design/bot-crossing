@@ -1,18 +1,49 @@
 import { mergeState } from './merge-state.js'
 
-async function req(url, options) {
-  const res = await fetch(url, options)
-  const body = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`)
-  return body
+/** Long enough for a slow scan, short enough that a hung server is noticed within a poll. */
+const TIMEOUT_MS = 12000
+/** Actions that start something on the far side (opening an app, re-running a workflow) get longer. */
+const ACTION_TIMEOUT_MS = 30000
+
+/**
+ * Run one request under a deadline, covering the body as well as the headers.
+ *
+ * Without it a server that accepts the connection and never answers leaves the promise pending
+ * for good, and everything awaiting it — above all the poll loop's "one at a time" latch —
+ * waits with it. The page then shows the last picture it had, unchanged, forever, with nothing
+ * to say it has stopped updating.
+ */
+async function timed(ms, run) {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), ms)
+  try {
+    return await run(ctl.signal)
+  } catch (err) {
+    if (err?.name === 'AbortError') throw new Error(`The server did not answer within ${Math.round(ms / 1000)} s`)
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
-const post = (url, payload) =>
-  req(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+const req = (url, options, ms = TIMEOUT_MS) =>
+  timed(ms, async (signal) => {
+    const res = await fetch(url, { ...options, signal })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`)
+    return body
   })
+
+const post = (url, payload) =>
+  req(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    ACTION_TIMEOUT_MS
+  )
 
 export const fetchThreads = () => req('/api/threads')
 
@@ -58,12 +89,15 @@ const SAVE_TRIES = 3
 export async function saveState(state) {
   let local = state
   for (let attempt = 0; attempt < SAVE_TRIES; attempt++) {
-    const res = await fetch('/api/state', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...local, baseUpdatedAt }),
+    const { res, body } = await timed(TIMEOUT_MS, async (signal) => {
+      const res = await fetch('/api/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...local, baseUpdatedAt }),
+        signal,
+      })
+      return { res, body: await res.json().catch(() => ({})) }
     })
-    const body = await res.json().catch(() => ({}))
 
     if (res.status === 409) {
       local = mergeState(baseSnapshot, local, body)
@@ -87,6 +121,9 @@ export async function saveState(state) {
  * what a Claude Code session id, or a Codex rollout id, actually looks like.
  */
 export const openThread = (thread) => post('/api/open', { harness: thread.harness, ref: thread.ref })
+
+/** Ask the harness to run this thread again. Only offered where `canRetry` is set. */
+export const retryThread = (thread) => post('/api/retry', { harness: thread.harness, ref: thread.ref })
 
 /** A brand new thread in a repo, via that harness's own new-session deep link. */
 export const newSession = (folder, harness) => post('/api/new-session', { folder, harness })

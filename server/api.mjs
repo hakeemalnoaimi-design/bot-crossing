@@ -1,14 +1,15 @@
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { openTarget } from './lib/opener.mjs'
 import { openInTerminal, schemeHasHandler, schemeOf } from './lib/xdg.mjs'
 import {
   defaultHarness,
   harnessStatus,
   newSession as harnessNewSession,
   openThread as harnessOpenThread,
+  retryThread as harnessRetryThread,
   scanThreads,
 } from './scan.mjs'
 
@@ -45,7 +46,7 @@ function migrate(raw) {
  * Colony state is only ever the things the *game* invents — which plot a project got,
  * what a thread's building looks like, what you archived, which repos you took off the map.
  * The threads themselves stay
- * read-only: this file is the only thing Bot Crossing writes, anywhere.
+ * read-only: this file is the only thing BotsBay World writes, anywhere.
  */
 const emptyState = () => ({
   version: STATE_VERSION,
@@ -63,23 +64,55 @@ const emptyState = () => ({
 const asObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {})
 const asArray = (v) => (Array.isArray(v) ? v : [])
 
+/**
+ * The last unreadable file we set aside, by its text. `GET /api/state` is polled, and an
+ * unreadable file stays unreadable until somebody fixes it, so without this every poll would
+ * leave another `.corrupt-` copy behind.
+ */
+let quarantined = null
+
+/**
+ * Only a file that is not there means "fresh install". Anything else — a half-written or
+ * hand-edited file that no longer parses, a sharing violation, a permissions error — is a file
+ * that *exists* and holds somebody's colony, and answering it with an empty state at
+ * `updatedAt: 0` is the worst available reply: the page treats 0 as "first write", saves its
+ * default layout, and the real file is gone. So those throw, the route answers 500, and nothing
+ * is written until a person has looked.
+ *
+ * A file that will not parse is copied aside first, so even a later hand-fix that goes wrong
+ * cannot cost the original bytes. A transient error (EBUSY, EPERM) is not copied: the file is
+ * probably fine and a copy would be a stale duplicate.
+ */
 async function readState() {
+  let text
   try {
-    const raw = migrate(JSON.parse(await fsp.readFile(STATE_FILE, 'utf8')))
-    return {
-      version: STATE_VERSION,
-      archived: asArray(raw.archived),
-      archivedAt: asObject(raw.archivedAt),
-      opened: asArray(raw.opened),
-      plots: asObject(raw.plots),
-      seen: asObject(raw.seen),
-      hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
-      viewedAt: asObject(raw.viewedAt),
-      settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
-      updatedAt: Number(raw.updatedAt) || 0,
+    text = await fsp.readFile(STATE_FILE, 'utf8')
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return emptyState()
+    throw err
+  }
+  let raw
+  try {
+    raw = migrate(JSON.parse(text))
+  } catch (err) {
+    if (quarantined !== text) {
+      const copy = `${STATE_FILE}.corrupt-${Date.now()}`
+      await fsp.copyFile(STATE_FILE, copy)
+      quarantined = text
     }
-  } catch {
-    return emptyState()
+    throw new Error(`colony.json could not be read (${err.message}); a copy was kept beside it as colony.json.corrupt-*`)
+  }
+  return {
+    version: STATE_VERSION,
+    archived: asArray(raw.archived),
+    archivedAt: asObject(raw.archivedAt),
+    opened: asArray(raw.opened),
+    plots: asObject(raw.plots),
+    seen: asObject(raw.seen),
+    hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
+    viewedAt: asObject(raw.viewedAt),
+    settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
+    updatedAt: Number(raw.updatedAt) || 0,
   }
 }
 
@@ -126,40 +159,16 @@ async function writeState(next) {
 }
 
 /**
-/**
- * Hand a `harness://…` deep link, or a folder, to whatever opens things on this OS. The
- * opener gets an argument list, never a shell string.
+ * A path that starts with two slashes of either kind names another machine (`\\host\share`,
+ * `//host/share`) or a Win32 device (`\\?\`, `\\.\`). `path.isAbsolute` calls all of them
+ * absolute, and merely `stat`-ing a UNC path makes Windows open an SMB connection to that host
+ * and offer the user's NTLM hash — so a page that can name one can phish the machine without
+ * ever reading a reply. Windows also accepts the slashes mixed (`\/`), hence the class.
  *
- * Only `present()` calls this, and no harness knowledge ever reaches it: an adapter says what it
- * wants opened and this decides how, which is the seam that keeps `server/harnesses/` swappable.
- *
- * macOS's `open(1)` does both jobs, and `xdg-open` is the Linux equivalent. On Windows the
- * equivalent is ShellExecute, reached through `rundll32 url.dll,FileProtocolHandler`: a
- * registered protocol URL goes to its app and a folder opens in Explorer, with the argument
- * passed through untouched. Two more obvious routes were tried and rejected — `explorer.exe
- * <url>` silently drops any URL that carries a query string, so `code/new?folder=…` never
- * arrived, and `cmd /c start` parses its own argument line, where the `%3A%5C` escapes in that
- * same link are exactly what it expands.
- *
- * The spawn is guarded because the opener may simply not be installed — a headless Linux box
- * has no `xdg-open` — and an unhandled `error` event on a child process takes the whole server
- * down. Failing quietly is right here: there is nothing the page could do with the error, and
- * the scan path must never depend on whether presentation worked.
+ * Judged on the raw string, before `path.resolve` or any fs call, and on every platform: a
+ * leading `//` is meaningless as a folder on a POSIX box too.
  */
-const OPENERS = {
-  darwin: ['open'],
-  win32: ['rundll32', 'url.dll,FileProtocolHandler'],
-  linux: ['xdg-open'],
-}
-
-function launch(target) {
-  const opener = OPENERS[process.platform]
-  if (!opener) return
-  const [cmd, ...args] = opener
-  const child = spawn(cmd, [...args, target], { stdio: 'ignore', detached: true })
-  child.on('error', () => {})
-  child.unref()
-}
+const isNetworkPath = (p) => /^[\\/]{2}/.test(p)
 
 /**
  * A folder is openable only if it is still on this machine and still a directory. Paths
@@ -168,12 +177,11 @@ function launch(target) {
  * Absolute is judged by `path.isAbsolute` rather than a leading `/`, which no Windows path has.
  */
 async function resolveFolder(folder) {
-  if (typeof folder !== 'string' || !path.isAbsolute(folder)) return null
+  if (typeof folder !== 'string' || isNetworkPath(folder) || !path.isAbsolute(folder)) return null
   const dir = path.resolve(folder)
   const stat = await fsp.stat(dir).catch(() => null)
   return stat && stat.isDirectory() ? dir : null
 }
-
 /**
  * Show a harness's answer to "open this" — `{ ok, url, command }` — and say truthfully whether
  * anything happened.
@@ -196,12 +204,12 @@ async function present(result) {
 
   if (process.platform !== 'linux') {
     if (!result.url) return { ok: false, error: 'That harness has no deep link to open on this platform' }
-    launch(result.url)
+    await openTarget(result.url)
     return { ok: true, url: result.url }
   }
 
   if (result.url && (await schemeHasHandler(result.url))) {
-    launch(result.url)
+    await openTarget(result.url)
     return { ok: true, url: result.url }
   }
   if (result.command) {
@@ -226,7 +234,7 @@ async function present(result) {
 /**
  * Mark the threads the colony has retired.
  *
- * Nothing is written anywhere. Bot Crossing used to set `isArchived` on the desktop app's own
+ * Nothing is written anywhere. Bot Crossing (the upstream project) used to set `isArchived` on the desktop app's own
  * session record, and it did land on disk — but the app serves from the copy it loaded at
  * launch, so the thread stayed put in its own list until the next restart, and the app would
  * rewrite the record from memory whenever it touched the thread. Papering over that took a
@@ -239,7 +247,16 @@ async function present(result) {
  * colony's own business. Nothing outside `data/colony.json` is ever written.
  */
 async function reconcileArchived(threads) {
-  const state = await readState()
+  // An unreadable colony file must not empty the island. The threads are read from the
+  // harnesses, not from it; all that is lost while it is broken is the archive filter, and
+  // /api/state still answers 500 so nothing writes over it in the meantime.
+  let state
+  try {
+    state = await readState()
+  } catch (err) {
+    console.warn(`[botsbay-world] ${err.message}`)
+    return threads
+  }
   if (!state.archived.length) return threads
   const wanted = new Set(state.archived)
 
@@ -292,16 +309,19 @@ for (const addrs of Object.values(os.networkInterfaces())) {
   }
 }
 
-/** Hostname out of a `Host:` or `Origin:` value, with the port and any brackets stripped. */
-function hostnameOf(value) {
-  if (!value) return ''
+/** Hostname and port out of a `Host:` or `Origin:` value, brackets stripped. `port` is '' when default. */
+function hostPartsOf(value) {
+  if (!value) return null
   const raw = String(value).includes('://') ? value : `http://${value}`
   try {
-    return new URL(raw).hostname.replace(/^\[|\]$/g, '')
+    const u = new URL(raw)
+    return { protocol: u.protocol, hostname: u.hostname.replace(/^\[|\]$/g, ''), port: u.port }
   } catch {
-    return ''
+    return null
   }
 }
+
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1'])
 
 /**
  * Only a page this server itself served may drive it. Two checks, against two different
@@ -316,15 +336,27 @@ function hostnameOf(value) {
  *     here — spawning sessions, opening Finder windows, or wiping the colony layout —
  *     even though it could never read the reply.
  *
+ * Origin is compared as host *and port*, not hostname alone. Any other local service —
+ * another dev server, a throwaway page on `localhost:9999` — is a different origin, and
+ * letting it through would hand it every write here. The Origin must be `http://` and must
+ * equal the request's own Host; the single allowance is that `localhost`, `127.0.0.1` and
+ * `::1` count as one another *on the same port*, because a page opened at `localhost:5274`
+ * may well call an API it reaches as `127.0.0.1:5274`.
+ *
  * A state-changing request with no `Origin` at all is refused: browsers always send one on
  * POST/PUT, so its absence means the caller is not the page. That does mean a bare `curl`
  * POST is rejected; pass `-H 'Origin: http://localhost:5274'` if you are scripting this.
  */
 function isLocalRequest(req) {
-  if (!LOCAL_HOSTS.has(hostnameOf(req.headers.host))) return false
+  const host = hostPartsOf(req.headers.host)
+  if (!host || !LOCAL_HOSTS.has(host.hostname)) return false
 
   const origin = req.headers.origin
-  if (origin && origin !== 'null') return LOCAL_HOSTS.has(hostnameOf(origin))
+  if (origin && origin !== 'null') {
+    const o = hostPartsOf(origin)
+    if (!o || o.protocol !== 'http:' || o.port !== host.port) return false
+    return o.hostname === host.hostname || (LOOPBACK.has(o.hostname) && LOOPBACK.has(host.hostname))
+  }
   return req.method === 'GET' || req.method === 'HEAD'
 }
 
@@ -345,6 +377,7 @@ function readJsonBody(req, limit = 4 * 1024 * 1024) {
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
       } catch (err) {
+        err.status = 400
         reject(err)
       }
     })
@@ -358,7 +391,7 @@ export async function apiMiddleware(req, res, next) {
   if (!url.pathname.startsWith('/api/')) return next ? next() : send(res, 404, { error: 'Not found' })
 
   if (!isLocalRequest(req)) {
-    return send(res, 403, { error: 'Bot Crossing only answers its own page on this machine' })
+    return send(res, 403, { error: 'BotsBay World only answers its own page on this machine' })
   }
 
   try {
@@ -398,7 +431,9 @@ export async function apiMiddleware(req, res, next) {
     if (url.pathname === '/api/state' && req.method === 'PUT') {
       const body = await readJsonBody(req)
       const base = Number(body.baseUpdatedAt) || 0
-      return serialise(async () => {
+      // `await` matters: a bare `return` would hand the rejection past this try/catch, and an
+      // unreadable colony file must come back as a 500 rather than an unhandled rejection.
+      return await serialise(async () => {
         const current = await readState()
         if (base && current.updatedAt !== base) return send(res, 409, current)
         return send(res, 200, await writeState(body))
@@ -411,13 +446,30 @@ export async function apiMiddleware(req, res, next) {
       return send(res, shown.ok ? 200 : 400, shown)
     }
 
+    /**
+     * Run something again in the harness it came from — the one endpoint here that changes
+     * anything outside this machine.
+     *
+     * It is behind the same Origin check as every other write, and the adapter is what decides
+     * whether the thing being asked for is legitimate: nothing here knows what a retryable
+     * thread looks like, and the `ref` travels through untouched, as it does everywhere else.
+     */
+    if (url.pathname === '/api/retry' && req.method === 'POST') {
+      const { harness, ref } = await readJsonBody(req)
+      const done = await harnessRetryThread(harness, ref)
+      return send(res, done.ok ? 200 : 400, done)
+    }
+
     if ((url.pathname === '/api/new-session' || url.pathname === '/api/reveal') && req.method === 'POST') {
       const { folder, harness } = await readJsonBody(req)
       const dir = await resolveFolder(folder)
+      if (typeof folder === 'string' && isNetworkPath(folder)) {
+        return send(res, 400, { ok: false, error: 'Network paths are not opened from here' })
+      }
       if (!dir) return send(res, 400, { ok: false, error: 'That folder is not on this machine any more' })
 
       if (url.pathname === '/api/reveal') {
-        launch(dir)
+        await openTarget(dir)
         return send(res, 200, { ok: true })
       }
       const shown = await present(await harnessNewSession(harness || (await defaultHarness()), dir))
@@ -426,6 +478,7 @@ export async function apiMiddleware(req, res, next) {
 
     return send(res, 404, { error: 'Unknown endpoint' })
   } catch (err) {
-    return send(res, 500, { error: String(err && err.message ? err.message : err) })
+    // A bad request (unparseable body, unknown harness) is the caller's mistake, not ours.
+    return send(res, err?.status || 500, { error: String(err && err.message ? err.message : err) })
   }
 }

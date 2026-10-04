@@ -1,9 +1,24 @@
 import * as THREE from 'three'
-import { PLANETS, createTerrain, createScatter, terrainHeight } from '../world/planet.js'
+import {
+  PLANETS,
+  createTerrain,
+  createScatter,
+  terrainHeight,
+  waterUniforms,
+  windUniforms,
+  colonyRadius,
+  flatLimit,
+  flatRadiusFor,
+  setColonyRadius,
+} from '../world/planet.js'
 import { Sky } from '../world/sky.js'
+import { Gulls } from '../world/gulls.js'
+import { Boats } from '../world/boats.js'
 import {
   Plot,
   allocateCells,
+  layoutExtent,
+  layoutReach,
   shipPosition,
   createLabel,
   hashString,
@@ -19,7 +34,8 @@ import { Indicators, BADGE } from '../agents/indicators.js'
 import { MAX_AGENT_CAP } from '../core/settings.js'
 import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
-import { liveThreadsForColony } from './hidden-projects.js'
+import { liveThreadsForColony, partitionDormant } from './hidden-projects.js'
+import { fitToSlots } from './roster.js'
 
 /**
  * The colony: everything that turns a list of agent threads into a place.
@@ -153,6 +169,11 @@ export class Colony {
     this.labelGroup = new THREE.Group()
     scene.add(this.plotGroup, this.labelGroup)
 
+    // Traffic: things that move on their own errands and carry no information, so the
+    // island is never completely still. Gulls over the shore, boats on the water.
+    this.gulls = new Gulls(scene)
+    this.boats = new Boats(scene)
+
     // Dismissing the HUD has to survive a poll: labels are chrome, and a scan landing while
     // everything is hidden must not quietly put them back on screen.
     this.uiVisible = true
@@ -189,6 +210,8 @@ export class Colony {
     this.ship.group.position.y = terrainHeight(ship.x, ship.z, this.planet)
 
     this._dustTint.set(this.planet.ground.high)
+    this.gulls.setPlanet(this.planet)
+    this.boats.setPlanet(this.planet)
   }
 
   /**
@@ -243,6 +266,11 @@ export class Colony {
     this.planet = planet
     this.sky.setPlanet(planet)
     this._buildTerrain()
+    // A world can bring its own zone palette, so every plot's colour is now potentially from
+    // the wrong one. Clearing the signatures makes the next sync rebuild them through the
+    // path that already knows how to take a plot apart, rather than a second teardown here.
+    for (const plot of this.plots.values()) plot.signature = ''
+    this.usedAccents.clear()
   }
 
   onSettingsChanged(changed, scope) {
@@ -267,36 +295,37 @@ export class Colony {
     const now = Date.now()
     const live = liveThreadsForColony(threads, archivedIds, hiddenProjects)
 
-    // Group by repo, biggest project first so the busiest work lands nearest the middle.
-    const byProject = new Map()
-    for (const thread of live) {
-      const key = thread.project || 'unknown'
-      if (!byProject.has(key)) byProject.set(key, [])
-      byProject.get(key).push(thread)
-    }
     /**
-     * Repos where nothing has stirred in days, folded away on request.
+     * Anything that has not stirred in days, left off the map on request.
      *
      * A colony is a map you learn, and a map is only learnable if what is on it is worth
      * looking at. Someone with a hundred checkouts has most of the ground given over to work
      * they finished in the spring, and the six repos they are actually living in are somewhere
-     * in among it. Dormant is already a status the colony understands — nothing for three days
-     * — so this is that same line drawn one level up, at the repo rather than the thread.
+     * in among it. Dormant is already a status the colony understands — nothing for three
+     * days — so this is that same line, drawn before anything is placed.
      *
-     * Deliberately all-or-nothing per repo: a zone with one live thread in it stays whole,
-     * because half a zone would misrepresent the repo rather than tidy the map.
+     * This used to be all-or-nothing per repo: a zone kept every one of its threads unless
+     * *all* of them were dormant, on the grounds that half a zone misrepresents the repo. That
+     * reasoning holds for a checkout with four threads. It falls apart at the scale a workflow
+     * harness brings — one zone of 184 n8n workflows, 143 of them switched off for months and
+     * a handful live, kept all 184 buildings on the map because the rule only ever asked
+     * whether the *whole* zone was quiet. The dead ones were most of what was being drawn.
+     *
+     * So the line is drawn per thread, and a zone that ends up with nothing left has folded
+     * away — which is the same outcome the old rule produced, reached one level down.
      */
-    const dormant = new Set()
-    if (this.settings.get('hideDormant')) {
-      for (const [name, list] of byProject) {
-        if (list.every((t) => statusFor(t, now) === 'sleeping')) dormant.add(name)
-      }
-      // Never fold away everything: a colony that answers a poll with an empty planet reads as
-      // broken rather than tidy, and there is nothing on screen to tell you which it was.
-      if (dormant.size === byProject.size) dormant.clear()
-      for (const name of dormant) byProject.delete(name)
+    const { shown, folded } = this.settings.get('hideDormant')
+      ? partitionDormant(live, (t) => statusFor(t, now) === 'sleeping')
+      : { shown: live, folded: new Set() }
+    this.dormantProjects = folded
+
+    // Group by repo, biggest project first so the busiest work lands nearest the middle.
+    const byProject = new Map()
+    for (const thread of shown) {
+      const key = thread.project || 'unknown'
+      if (!byProject.has(key)) byProject.set(key, [])
+      byProject.get(key).push(thread)
     }
-    this.dormantProjects = dormant
 
     const projects = [...byProject.entries()].sort((a, b) => {
       if (b[1].length !== a[1].length) return b[1].length - a[1].length
@@ -309,7 +338,7 @@ export class Colony {
     // reclaims the same ground if it is still free. Re-inserting the entry also keeps
     // LAYOUT_MEMORY from evicting a name you only hid — otherwise a zone folded away for a
     // week loses where it used to be, and comes back somewhere else entirely.
-    for (const name of [...hiddenProjects, ...dormant]) {
+    for (const name of [...hiddenProjects, ...folded]) {
       const cells = this.plotCells.get(name)
       if (!cells) continue
       this.plotCells.delete(name)
@@ -333,13 +362,21 @@ export class Colony {
       // Oldest thread first, so a given session keeps its slot as siblings come and go.
       list.sort((a, b) => a.createdAt - b.createdAt)
 
-      list.forEach((thread, i) => {
-        const status = statusFor(thread, now)
+      const rows = list.map((thread) => ({ thread, status: statusFor(thread, now) }))
+      for (const { status } of rows) {
         if (stats[status] !== undefined) stats[status]++
         if (status === 'waiting' || status === 'blocked') urgent.add(plot.id)
         if (status === 'waiting' || status === 'blocked' || status === 'working') active.add(plot.id)
         stats.agents++
+      }
 
+      // A zone holds what its slots hold. Past that the threads that are asking for something
+      // win the slots and the rest get no building — counted above, so the numbers stay true,
+      // and reported on the name plate and in the sidebar rather than stacked on one another.
+      const { drawn, overflow } = fitToSlots(rows, plot.capacity)
+      this._setOverflow(plot, overflow)
+
+      drawn.forEach(({ thread, status }, i) => {
         const building = this._syncBuilding(thread, plot, i)
         seenBuildings.add(thread.id)
 
@@ -372,13 +409,39 @@ export class Colony {
     return this.stats
   }
 
+  /**
+   * Put "+N more" on a zone's name plate. The plate is a canvas drawn once, so a change in the
+   * count means drawing it again; nothing else about the plot is touched. A rebuilt plot comes
+   * back with a plain plate and `overflow` unset, which is why this runs on every poll.
+   */
+  _setOverflow(plot, overflow) {
+    if ((plot.overflow ?? 0) === overflow) return
+    plot.overflow = overflow
+    if (!plot.label) return
+    const old = plot.label
+    this.labelGroup.remove(old)
+    old.userData.dispose?.()
+    const label = createLabel(overflow ? `${plot.name} · +${overflow} more` : plot.name, plot.accent)
+    label.position.copy(old.position)
+    // Carried over so a plate that is showing does not blink out and fade back in.
+    label.material.opacity = old.material.opacity
+    label.visible = old.visible
+    plot.label = label
+    this.labelGroup.add(label)
+  }
+
   _syncPlots(projects) {
     // The previous layout is an input, so a zone only moves when its own footprint changes
     // — never because a different repo gained or lost a thread. `plotCells` carries it
     // between polls, and the colony file carries it between sessions.
+    //
+    // `list` is already only what will be drawn: dormant threads were folded away before the
+    // grouping, and a zone's footprint is capped at what its slots hold. The layout is held
+    // inside the flat ground the world allows, so a saved zone out past it is placed again.
     const layout = allocateCells(
       projects.map(([name, list]) => ({ id: name, size: list.length })),
-      this.plotCells
+      this.plotCells,
+      layoutReach(flatLimit(this.planet))
     )
     // Remembered, not replaced: a project that has just lost its last thread keeps its
     // ground on the books, and the oldest entries fall off the end.
@@ -422,8 +485,12 @@ export class Colony {
     })
 
     this.plotOrder = [...this.plots.values()]
+    // The flat ground and the walkable grid follow the layout, so a zone is never on a dune or
+    // off the edge of the map. A new radius is new terrain, and that rebuilds the scatter and
+    // the grid along with it.
+    if (setColonyRadius(flatRadiusFor(layoutExtent(layout), this.planet))) this._buildTerrain()
     // Zones that just moved, appeared or grew are zones the scatter does not know about.
-    if (this.scatterGroup && this._plotFootprint() !== this._scatterFootprint) this._buildScatter()
+    else if (this.scatterGroup && this._plotFootprint() !== this._scatterFootprint) this._buildScatter()
     // Which hex cells are decked. Ground height is asked for once per moving agent per
     // frame, so it wants to be a lookup rather than a scan over every plot's every tile.
     this.deckedCells = new Set()
@@ -455,17 +522,28 @@ export class Colony {
     return terrainHeight(x, z, this.planet)
   }
 
-  /** A stable colour per repo, probing forward on a collision so no two plots match. */
+  /**
+   * A stable colour per repo, probing forward on a collision so no two plots match.
+   *
+   * The world chooses the palette: Bahrain's zones are pearl white, and any world without an
+   * opinion gets the default. Hashing the *name* is what keeps a repo the same colour across
+   * reloads, and it keeps its place in the palette when the palette itself changes.
+   */
+  _palette() {
+    return this.planet.palette ?? PLOT_PALETTE
+  }
+
   _pickAccent(name) {
-    const start = hashString(name) % PLOT_PALETTE.length
-    for (let i = 0; i < PLOT_PALETTE.length; i++) {
-      const accent = PLOT_PALETTE[(start + i) % PLOT_PALETTE.length]
+    const palette = this._palette()
+    const start = hashString(name) % palette.length
+    for (let i = 0; i < palette.length; i++) {
+      const accent = palette[(start + i) % palette.length]
       if (!this.usedAccents.has(accent)) {
         this.usedAccents.add(accent)
         return accent
       }
     }
-    return PLOT_PALETTE[start]
+    return palette[start]
   }
 
   _syncBuilding(thread, plot, index) {
@@ -474,7 +552,10 @@ export class Colony {
     const target = 1
 
     if (!entry) {
-      const mesh = createBuilding({ seed: hashString(thread.id), accent: plot.accent })
+      // A structure normally wears its zone's colour; the world's own default accent is the
+      // fallback for one that has no zone to take a colour from.
+      const accent = plot.accent ?? this.planet.accent
+      const mesh = createBuilding({ seed: hashString(thread.id), accent })
       const pos = plot.worldSlot(index)
       mesh.position.copy(pos)
       mesh.rotation.y = ((hashString(thread.id) >>> 8) % 360) * (Math.PI / 180)
@@ -525,6 +606,9 @@ export class Colony {
    * of buildings, which is exactly where the crew needs to walk.
    */
   _rebuildNavigation() {
+    // Walkable ground reaches a stride or two past the flat colony, so a builder can stand on
+    // the verge of the outermost zone and still walk home from it.
+    this.nav.resize(colonyRadius() + 10)
     const obstacles = []
     for (const entry of this.buildings.values()) {
       if (entry.retiring) continue
@@ -711,29 +795,54 @@ export class Colony {
     if (cycled) this.settings.values.timeOfDay = this.sky.time
 
     const night = this.sky.nightFactor ?? 0
-    buildingUniforms.uNight.value = night
-    // One write turns every rotor in the colony.
+    // The sea darkens on the same signal, in the terrain material rather than the buffer.
+    waterUniforms.uNight.value = night
+    // One write turns every rotor in the colony, and one sways every palm.
     buildingUniforms.uTime.value = elapsed
+    windUniforms.uWind.value = elapsed
     this.ship.update(dt, elapsed, night)
 
+    const anim = this.settings.get('reducedMotion') ? 0.35 : 1
     this._growBuildings(dt)
-    this.astronauts.update(dt, elapsed)
+    this._lightBuildings(night)
+    this.astronauts.update(dt, elapsed, this.camera)
     this.astronauts.updateRings(elapsed)
     this.indicators.update(this.astronauts.agents, elapsed, (a) => this._badgeFor(a))
     this._emit(dt, elapsed)
     this.particles.ambient(dt, this.camera, this.planet)
     this.particles.update(dt)
+    this.gulls.update(dt, elapsed, anim)
+    this.boats.update(dt, elapsed, anim)
     this._updatePlots(night, elapsed)
     this._updateScaffolds()
     this._updateLabels(dt)
+  }
+
+  /**
+   * Windows and lamps come on building by building through the evening rather than all
+   * fading up together: each has a moment of its own (`lightsAt`, from its seed), and the
+   * shader takes a per-building `uLit` rather than the shared night factor.
+   */
+  _lightBuildings(night) {
+    for (const entry of this.buildings.values()) {
+      const at = entry.mesh.userData.lightsAt ?? 0.5
+      entry.mesh.userData.uniforms.uLit.value = THREE.MathUtils.smoothstep(night, at - 0.03, at + 0.03)
+    }
   }
 
   _growBuildings(dt) {
     for (const [id, entry] of this.buildings) {
       // A running thread's site creeps upward while you watch it.
       if (!entry.retiring && this._isLive(id)) entry.target = Math.min(1, entry.target + LIVE_GROWTH * dt)
-      const next = THREE.MathUtils.damp(entry.progress, entry.target, 1.8, dt)
-      if (Math.abs(next - entry.progress) > 0.0005) {
+      let next = THREE.MathUtils.damp(entry.progress, entry.target, 1.8, dt)
+      // Land on the target rather than creeping toward it forever. The ease converges but
+      // never arrives, and the per-frame step used to fall under the update threshold at
+      // about 0.98 — where the building shader still counts the structure as *under
+      // construction*: a glowing band round the foot of every finished building, in the
+      // zone's accent, for as long as the page was open. That band was most of what made
+      // the island read as blown out by day and as a field of white rings at night.
+      if (Math.abs(entry.target - next) < 0.01) next = entry.target
+      if (next !== entry.progress) {
         entry.progress = next
         entry.mesh.userData.setProgress(next)
       }
@@ -871,6 +980,8 @@ export class Colony {
     this.indicators.dispose()
     this.particles.dispose()
     this.scaffolds.dispose()
+    this.gulls.dispose()
+    this.boats.dispose()
     disposeTree(this.worldGroup)
     disposeTree(this.plotGroup)
     disposeTree(this.labelGroup)

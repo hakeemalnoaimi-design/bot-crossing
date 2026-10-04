@@ -21,7 +21,7 @@
 
 /** Cell size, in metres. Small enough to resolve the gaps between neighbouring buildings. */
 const CELL = 0.5
-/** Half-width of the navigable square. Comfortably contains the colony and the landing pad. */
+/** Half-width of the navigable square for the smallest colony. See `resize` for the rest. */
 const HALF = 56
 /** Give up rather than stall the frame if a search goes pathological. */
 const MAX_EXPANSIONS = 6000
@@ -29,10 +29,17 @@ const MAX_EXPANSIONS = 6000
 const SQRT2 = Math.SQRT2
 
 export class Navigation {
-  constructor() {
+  constructor(half = HALF) {
     this.cell = CELL
-    this.half = HALF
-    this.size = Math.ceil((HALF * 2) / CELL)
+    this.generation = 0
+    /** Bumped on every rebuild; agents use it to notice their path is stale. */
+    this.version = 0
+    this._allocate(half)
+  }
+
+  _allocate(half) {
+    this.half = half
+    this.size = Math.ceil((half * 2) / CELL)
     const n = this.size * this.size
 
     this.blocked = new Uint8Array(n)
@@ -44,10 +51,18 @@ export class Navigation {
     this.heap = new Int32Array(n)
     this.heapKey = new Float32Array(n)
     this.heapSize = 0
+  }
 
-    this.generation = 0
-    /** Bumped on every rebuild; agents use it to notice their path is stale. */
-    this.version = 0
+  /**
+   * Make the grid wider or narrower to follow the colony: the square has to contain the whole
+   * layout, and the layout grows with the roster. A no-op when the width has not changed, which
+   * is nearly always; the buffers are only reallocated when the colony's footprint steps. The
+   * next `rebuild` is what fills it in.
+   */
+  resize(half) {
+    if (half === this.half) return
+    this._allocate(half)
+    this.version++
   }
 
   // ── grid <-> world ──────────────────────────────────────────────────────────────────
