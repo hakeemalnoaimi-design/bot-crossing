@@ -320,7 +320,7 @@ async function scanThreads() {
   // snapshot immediately and lets the refresh land in the background — the poll is never held
   // open on a network call.
   if (!snapshot.at) return refreshOnce()
-  if (!fresh) refreshOnce()
+  if (!fresh || snapshot.stale) refreshOnce()
   return snapshot.threads
 }
 
@@ -345,38 +345,103 @@ function newSession() {
 }
 
 /**
+ * Executions a retry has already been sent for, and ones a retry is on the wire for right now.
+ *
+ * n8n leaves the original execution at `error` after a retry — the new run is a separate
+ * execution — so the instance alone cannot say "this was already handled" until it has also
+ * written `retrySuccessId`, and that only happens if the retry succeeds. Without a memory here a
+ * double click, or the same button in two tabs, re-runs a production workflow twice. The map is
+ * bounded by age and by size: a failure that is still the latest ten minutes on is worth asking
+ * about again, and the thing must not grow for as long as the server stays up.
+ */
+const RETRIED_TTL_MS = 10 * 60 * 1000
+const RETRIED_MAX = 200
+const retried = new Map() // executionId -> when it was sent
+const retrying = new Set() // executionIds with a POST pending
+
+function wasRetried(executionId, now = Date.now()) {
+  for (const [id, at] of retried) {
+    if (now - at > RETRIED_TTL_MS) retried.delete(id)
+  }
+  return retried.has(executionId)
+}
+
+function rememberRetried(executionId, now = Date.now()) {
+  retried.set(executionId, now)
+  // Maps iterate oldest-first, so the first key is the one to give up.
+  while (retried.size > RETRIED_MAX) retried.delete(retried.keys().next().value)
+}
+
+/**
  * Ask n8n to run a failed execution again. The one write in the project.
  *
- * Both ids are pattern-checked before they reach the URL, and the execution is re-read first
- * so that a `ref` from a stale scan cannot retry something that has since succeeded — the
- * button is drawn from a poll that may be a quarter of a minute old, and "retry" on a run
- * that is now green would silently start work nobody asked for.
+ * The execution id is **never taken from the page**. A `ref` makes a round trip through the
+ * browser and is the one part of a thread nothing in between inspects, so trusting it would let
+ * anyone who can reach the API retry any old failure of any workflow — each of which re-runs a
+ * production workflow, emails and all. Only the workflow id is read from it; the execution is
+ * whatever this adapter's own snapshot says is that workflow's latest run, and only if that run
+ * failed and the thread was offered `canRetry`. If the page *also* named an execution and it is
+ * not that one, the retry is refused rather than quietly redirected: the button was drawn for a
+ * run that is no longer the latest, and the person should see the current state before deciding.
+ *
+ * The execution is still re-read from n8n before anything is posted, because the snapshot may
+ * be a quarter of a minute old and "retry" on a run that has since gone green would silently
+ * start work nobody asked for. That read is also where `retrySuccessId` is checked: n8n sets it
+ * on an execution once a retry of it has succeeded.
  */
 async function retry(ref) {
-  const { workflowId, executionId } = ref || {}
-  if (!isWorkflowId(workflowId) || !isExecutionId(executionId)) {
+  const workflowId = ref?.workflowId
+  if (!isWorkflowId(workflowId)) {
     return { ok: false, error: 'That thread has no failed n8n execution to retry' }
   }
-  let current
+  const thread = snapshot.threads.find((t) => t.id === ID(workflowId))
+  const executionId = thread?.ref?.executionId
+  if (!thread || !thread.canRetry || !isExecutionId(executionId)) {
+    return { ok: false, error: 'That workflow has no failed latest run to retry' }
+  }
+  const claimed = ref?.executionId
+  if (claimed != null && claimed !== '' && String(claimed) !== executionId) {
+    return { ok: false, error: 'A newer run exists than the one that was on screen — refresh and look again' }
+  }
+
+  // Everything from here to the lock is synchronous, so two calls cannot both get past it.
+  if (retrying.has(executionId)) {
+    return { ok: false, error: `A retry of execution ${executionId} is already in progress` }
+  }
+  if (wasRetried(executionId)) {
+    return { ok: false, error: `Execution ${executionId} was already retried — wait for the new run` }
+  }
+  retrying.add(executionId)
   try {
-    current = await call(`/api/v1/executions/${executionId}`)
-  } catch (err) {
-    return { ok: false, error: `Could not read that execution — ${err?.message || err}` }
+    let current
+    try {
+      current = await call(`/api/v1/executions/${executionId}`)
+    } catch (err) {
+      return { ok: false, error: `Could not read that execution — ${err?.message || err}` }
+    }
+    if (String(current?.workflowId ?? '') !== workflowId) {
+      return { ok: false, error: 'That execution does not belong to that workflow' }
+    }
+    if (!FAILED.has(current?.status)) {
+      return { ok: false, error: `That run is ${current?.status || 'no longer failed'} — nothing to retry` }
+    }
+    if (current?.retrySuccessId) {
+      return { ok: false, error: `That run was already retried successfully (as ${current.retrySuccessId})` }
+    }
+    try {
+      await call(`/api/v1/executions/${executionId}/retry`, { method: 'POST' })
+    } catch (err) {
+      // Not remembered: n8n said no, so nothing ran and a second try is legitimate.
+      return { ok: false, error: `n8n refused the retry — ${err?.message || err}` }
+    }
+    rememberRetried(executionId)
+    // The colony should show the new run rather than the old failure. Marked stale, not zeroed:
+    // `at === 0` means "never scanned", which makes the next scan wait on n8n.
+    snapshot = { ...snapshot, stale: true }
+    return { ok: true, message: `Retrying execution ${executionId}` }
+  } finally {
+    retrying.delete(executionId)
   }
-  if (String(current?.workflowId ?? '') !== workflowId) {
-    return { ok: false, error: 'That execution does not belong to that workflow' }
-  }
-  if (!FAILED.has(current?.status)) {
-    return { ok: false, error: `That run is ${current?.status || 'no longer failed'} — nothing to retry` }
-  }
-  try {
-    await call(`/api/v1/executions/${executionId}/retry`, { method: 'POST' })
-  } catch (err) {
-    return { ok: false, error: `n8n refused the retry — ${err?.message || err}` }
-  }
-  // The colony should show the new run rather than the old failure, so drop the snapshot.
-  snapshot = { threads: snapshot.threads, at: 0 }
-  return { ok: true, message: `Retrying execution ${executionId}` }
 }
 
 /** Why the list is empty, when it is. Shown in the harness list rather than swallowed. */
@@ -400,6 +465,8 @@ export default {
     snapshot = { threads: [], at: 0 }
     inFlight = null
     lastError = ''
+    retried.clear()
+    retrying.clear()
   },
   _shape: { toThread, latestPerWorkflow, zoneOf },
 }

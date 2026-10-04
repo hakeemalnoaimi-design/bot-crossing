@@ -60,6 +60,8 @@ let selectedProject = null
 let hoverId = null
 let statusCursor = 0
 let pendingSave = 0
+/** A retry is on the wire. Module state rather than the button, so the `R` key sees it too. */
+let retrying = false
 const hoverGround = new THREE.Vector3()
 
 // ── actions the HUD can trigger ────────────────────────────────────────────────────────
@@ -246,14 +248,25 @@ const actions = {
    * afterwards because the answer — a new run, in a new state — is on the next scan.
    */
   retryThread: async () => {
+    // One at a time. The server refuses a second retry too, but the button and `R` should not
+    // even ask: a double click is the likeliest way to run a production workflow twice.
+    if (retrying) return
     const thread = threads.find((t) => t.id === selectedId)
     if (!thread || !thread.canRetry) return
+    // This re-runs a live workflow, side effects and all, so it is the one action that asks first.
+    if (!window.confirm(`Re-run the failed execution of “${thread.title}” in n8n? This runs the production workflow again.`)) return
+    retrying = true
+    hud.setRetryBusy(true)
     try {
       const done = await retryThread(thread)
       hud.toast(done.message || 'Retrying')
       setTimeout(poll, 1800)
     } catch (err) {
+      // The server's refusal (already retried, a newer run, no longer failed) arrives as the message.
       hud.toast(err.message || 'Could not retry that', 'err')
+    } finally {
+      retrying = false
+      hud.setRetryBusy(false)
     }
   },
 

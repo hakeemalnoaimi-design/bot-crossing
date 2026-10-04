@@ -305,28 +305,138 @@ test('Open deep-links to the run, or to the workflow when there is none', async 
   await cleanup()
 })
 
-test('Retry only fires on a run that actually failed', async () => {
+const ago = (n) => new Date(Date.now() - n).toISOString()
+const retryPosts = (stub) => stub.seen.filter((c) => c.method === 'POST')
+
+test('Retry posts once, to the latest failed run, and checks the ref', async () => {
   const stub = await fakeN8n({
     workflows: [workflow({ id: 'w' })],
-    executions: [execution({ id: '77', workflowId: 'w', status: 'error' }), execution({ id: '88', workflowId: 'w', status: 'success' })],
+    executions: [execution({ id: '77', workflowId: 'w', status: 'error' })],
   })
   const { harness, cleanup } = await adapterFor(stub.base)
-
-  const failed = await harness.retry({ workflowId: 'w', executionId: '77' })
-  assert.equal(failed.ok, true, 'a failed run is retried')
-  assert.ok(stub.seen.some((c) => c.path === '/api/v1/executions/77/retry' && c.method === 'POST'))
-
-  // The button is drawn from a poll that may be seconds stale, so the adapter re-reads first.
-  const succeeded = await harness.retry({ workflowId: 'w', executionId: '88' })
-  assert.equal(succeeded.ok, false, 'a run that has since gone green is not re-run')
-  assert.equal(stub.seen.some((c) => c.path === '/api/v1/executions/88/retry'), false, 'and nothing was posted')
-
-  // Nor is one that belongs to a different workflow than the ref claims.
-  const mismatched = await harness.retry({ workflowId: 'other', executionId: '77' })
-  assert.equal(mismatched.ok, false)
+  await harness.scanThreads()
 
   const malformed = await harness.retry({ workflowId: 'w', executionId: 'abc; rm -rf /' })
-  assert.equal(malformed.ok, false)
+  assert.equal(malformed.ok, false, 'a ref naming something that is not the latest run is refused')
+  const unknown = await harness.retry({ workflowId: 'other', executionId: '77' })
+  assert.equal(unknown.ok, false, 'a workflow the snapshot does not know has nothing to retry')
+  assert.equal(retryPosts(stub).length, 0)
+
+  const failed = await harness.retry({ workflowId: 'w', executionId: '77' })
+  assert.equal(failed.ok, true, 'a failed latest run is retried')
+  assert.deepEqual(retryPosts(stub).map((c) => c.path), ['/api/v1/executions/77/retry'], 'exactly one POST')
+  await stub.close()
+  await cleanup()
+})
+
+test('A client-supplied execution id is never the one that is retried', async () => {
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'w' })],
+    executions: [
+      execution({ id: '10', workflowId: 'w', status: 'error', startedAt: ago(3 * 60_000) }),
+      execution({ id: '20', workflowId: 'w', status: 'error', startedAt: ago(60_000) }),
+    ],
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+
+  const stale = await harness.retry({ workflowId: 'w', executionId: '10' })
+  assert.equal(stale.ok, false, 'an old failure of the same workflow is refused')
+  assert.equal(retryPosts(stub).length, 0, 'and nothing was posted for it')
+
+  // No claim at all is fine: the id comes from the adapter's own snapshot.
+  const bare = await harness.retry({ workflowId: 'w' })
+  assert.equal(bare.ok, true)
+  assert.deepEqual(retryPosts(stub).map((c) => c.path), ['/api/v1/executions/20/retry'])
+  await stub.close()
+  await cleanup()
+})
+
+test('Retry is refused when the latest run succeeded', async () => {
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'w' })],
+    executions: [
+      execution({ id: '77', workflowId: 'w', status: 'error', startedAt: ago(120_000) }),
+      execution({ id: '88', workflowId: 'w', status: 'success', startedAt: ago(60_000) }),
+    ],
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  // Neither the old failure nor the green run can be retried: the latest is not a failure.
+  assert.equal((await harness.retry({ workflowId: 'w', executionId: '77' })).ok, false)
+  assert.equal((await harness.retry({ workflowId: 'w', executionId: '88' })).ok, false)
+  assert.equal(retryPosts(stub).length, 0)
+  await stub.close()
+  await cleanup()
+})
+
+test('A run that went green since the last poll is not retried', async () => {
+  const executions = [execution({ id: '77', workflowId: 'w', status: 'error' })]
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'w' })], executions })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  executions[0].status = 'success' // the instance moved on after the snapshot was taken
+  const result = await harness.retry({ workflowId: 'w', executionId: '77' })
+  assert.equal(result.ok, false)
+  assert.equal(retryPosts(stub).length, 0)
+  await stub.close()
+  await cleanup()
+})
+
+test('A second retry while one is pending is refused', async () => {
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'w' })],
+    executions: [execution({ id: '77', workflowId: 'w', status: 'error' })],
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  const [first, second] = await Promise.all([
+    harness.retry({ workflowId: 'w', executionId: '77' }),
+    harness.retry({ workflowId: 'w', executionId: '77' }),
+  ])
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, false)
+  assert.match(second.error, /already in progress/)
+  assert.equal(retryPosts(stub).length, 1, 'one POST, not two')
+  await stub.close()
+  await cleanup()
+})
+
+test('A retried run cannot be retried again, and the next scan does not block on n8n', async () => {
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'w' })],
+    executions: [execution({ id: '77', workflowId: 'w', status: 'error' })],
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  assert.equal((await harness.retry({ workflowId: 'w', executionId: '77' })).ok, true)
+
+  // n8n still reports the original as `error`, so the adapter has to remember.
+  const again = await harness.retry({ workflowId: 'w', executionId: '77' })
+  assert.equal(again.ok, false)
+  assert.match(again.error, /already retried/)
+  assert.equal(retryPosts(stub).length, 1)
+
+  // Stale, not "never scanned": the poll answers from the snapshot and refreshes behind it.
+  stub.seen.length = 0
+  const threads = await harness.scanThreads()
+  assert.equal(threads.length, 1, 'answered immediately from the last snapshot')
+  await new Promise((r) => setTimeout(r, 100))
+  assert.ok(stub.seen.some((c) => c.path === '/api/v1/executions'), 'and a refresh was kicked off')
+  await stub.close()
+  await cleanup()
+})
+
+test('A run n8n already shows as retried successfully is refused', async () => {
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'w' })],
+    executions: [execution({ id: '77', workflowId: 'w', status: 'error', retrySuccessId: '99' })],
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  const result = await harness.retry({ workflowId: 'w', executionId: '77' })
+  assert.equal(result.ok, false)
+  assert.equal(retryPosts(stub).length, 0)
   await stub.close()
   await cleanup()
 })

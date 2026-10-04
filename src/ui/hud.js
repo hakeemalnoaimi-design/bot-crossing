@@ -625,6 +625,11 @@ export class Hud {
     this.$('#btn-retry').hidden = !thread.canRetry
   }
 
+  /** Disabled while a retry is on the wire, so the button cannot be clicked twice. */
+  setRetryBusy(busy) {
+    this.$('#btn-retry').disabled = Boolean(busy)
+  }
+
   /**
    * Put the thread card beside its own astronaut, in screen space, every frame.
    *
