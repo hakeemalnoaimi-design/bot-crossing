@@ -1418,3 +1418,105 @@ kbd {
   }
 }
 .botsbay-canvas { cursor: grab; }
+
+/* ── scan status: coverage, freshness, warnings ──────────────────────────────────── */
+
+.side .scan {
+  flex: none;
+  padding: 7px 15px 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--dim);
+}
+
+.side .scan:not(:has(.coverage:not([hidden]), .fresh:not(:empty), .warns:not([hidden]))) {
+  display: none;
+}
+
+.side .scan .coverage {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.side .scan .fresh.amber {
+  color: var(--amber);
+}
+
+.side .scan .warns {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  color: var(--amber);
+}
+
+.side .scan .warns li {
+  padding-left: 12px;
+  position: relative;
+  overflow-wrap: anywhere;
+}
+
+.side .scan .warns li::before {
+  content: '!';
+  position: absolute;
+  left: 3px;
+  font-weight: 700;
+}
+
+/* ── threads with no builder ─────────────────────────────────────────────────────── */
+
+.side .asleep-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 2px;
+  padding: 7px 9px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  text-align: left;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.side .asleep-toggle:hover {
+  color: var(--muted);
+}
+
+.side .asleep-toggle::after {
+  content: '';
+  width: 5px;
+  height: 5px;
+  margin-left: auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 140ms ease;
+}
+
+.side .asleep-toggle[aria-expanded='true']::after {
+  transform: rotate(45deg);
+}
+
+.side .thread.asleep {
+  grid-template-columns: auto 1fr auto auto;
+  opacity: 0.55;
+  color: #7c7b86;
+}
+
+.side .thread.asleep:hover {
+  opacity: 0.9;
+}
+
+.side .thread.asleep .open {
+  font-size: 10.5px;
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 1px 6px;
+}

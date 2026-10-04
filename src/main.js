@@ -138,6 +138,9 @@ const actions = {
 
   focusThread: (id) => select(id, { fly: true }),
 
+  /** A thread with no builder has nothing to fly to, so its row opens the thread instead. */
+  openById: (id) => actions.openThread(id),
+
   /**
    * A new thread in this repo. The desktop app opens an empty session with the folder as
    * its workspace — nothing here is resumed, and nothing is written to disk.
@@ -225,8 +228,12 @@ const actions = {
     }
   },
 
-  openThread: async () => {
-    const thread = threads.find((t) => t.id === selectedId)
+  /**
+   * Open a thread in the harness it came from. With no id it is the selected builder's; with one
+   * it is a row in the sidebar's Asleep group, which has no builder to select.
+   */
+  openThread: async (id = selectedId) => {
+    const thread = threads.find((t) => t.id === id)
     if (!thread) return
     try {
       await openThread(thread)
@@ -436,6 +443,12 @@ function syncProject() {
       title: thread.title,
       worktree: thread.worktree,
       lastActivityAt: thread.lastActivityAt,
+      lastRunAt: thread.lastRunAt,
+      staleSince: thread.staleSince,
+      harness: thread.harness,
+      // Has a builder on the island. The rest are over the cap or past the zone's slots, and
+      // clicking one cannot fly anywhere — the sidebar lists them apart, with Open instead.
+      drawn: colony.astronauts.isDrawn(thread.id),
       status: statusFor(thread, now),
     }))
     // Whoever wants something first, then most recently touched — the same order of
@@ -677,13 +690,29 @@ function applyThreads(list) {
   const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
   hud.setStats(stats)
 
+  // How much of the roster is actually on the island. Over the crew cap or a zone's slots the
+  // rest have no builder, and a map that silently shows 84 of 445 reads as the whole truth.
+  const now = Date.now()
+  let undrawn = 0
+  let undrawnAsleep = 0
+  for (const t of colony.threads.values()) {
+    if (colony.astronauts.isDrawn(t.id)) continue
+    undrawn++
+    if (statusFor(t, now) === 'sleeping') undrawnAsleep++
+  }
+  hud.setCoverage({ shown: colony.threads.size - undrawn, total: colony.threads.size, asleep: undrawn === undrawnAsleep })
+
   legendProjects = colony.plotOrder
-    .map((plot) => ({
-      name: plot.name,
-      accent: plot.accent,
-      count: list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name).length,
-      urgent: colony.urgentPlots?.has(plot.id) ?? false,
-    }))
+    .map((plot) => {
+      const mine = list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name)
+      return {
+        name: plot.name,
+        accent: plot.accent,
+        count: mine.length,
+        drawn: mine.filter((t) => colony.astronauts.isDrawn(t.id)).length,
+        urgent: colony.urgentPlots?.has(plot.id) ?? false,
+      }
+    })
     .sort((a, b) => b.count - a.count)
 
   // Keep the card honest if the thread it is showing changed underneath it.
@@ -713,11 +742,25 @@ async function poll() {
   try {
     const res = await fetchThreads()
     applyThreads(res.threads || [])
+    // `warnings` are the harnesses that could not be read, and `scannedAt` is when the server
+    // last looked: both used to be thrown away, so a harness that stopped answering left the
+    // map frozen at its last roster with nothing on screen to say so.
+    hud.setHealth({
+      ok: true,
+      warnings: res.warnings || [],
+      scannedAt: Number(res.scannedAt) || Date.now(),
+      stale: (res.threads || []).some((t) => t.staleSince),
+    })
     hud.removeBoot()
   } catch (err) {
+    // Stays on screen, unlike the toast: the old picture is still up, and what it needs is a
+    // standing note that it is old.
+    hud.setHealth({ ok: false, error: err.message || 'Could not reach the thread scanner' })
     hud.toast(err.message || 'Could not reach the thread scanner', 'err')
     hud.removeBoot()
   } finally {
+    // Unconditionally, and the fetch has a deadline, so this is reached even when the server
+    // accepts the request and never answers.
     polling = false
   }
 }

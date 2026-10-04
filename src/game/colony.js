@@ -22,6 +22,7 @@ import { MAX_AGENT_CAP } from '../core/settings.js'
 import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
 import { liveThreadsForColony, partitionDormant } from './hidden-projects.js'
+import { fitToSlots } from './roster.js'
 
 /**
  * The colony: everything that turns a list of agent threads into a place.
@@ -348,13 +349,21 @@ export class Colony {
       // Oldest thread first, so a given session keeps its slot as siblings come and go.
       list.sort((a, b) => a.createdAt - b.createdAt)
 
-      list.forEach((thread, i) => {
-        const status = statusFor(thread, now)
+      const rows = list.map((thread) => ({ thread, status: statusFor(thread, now) }))
+      for (const { status } of rows) {
         if (stats[status] !== undefined) stats[status]++
         if (status === 'waiting' || status === 'blocked') urgent.add(plot.id)
         if (status === 'waiting' || status === 'blocked' || status === 'working') active.add(plot.id)
         stats.agents++
+      }
 
+      // A zone holds what its slots hold. Past that the threads that are asking for something
+      // win the slots and the rest get no building — counted above, so the numbers stay true,
+      // and reported on the name plate and in the sidebar rather than stacked on one another.
+      const { drawn, overflow } = fitToSlots(rows, plot.capacity)
+      this._setOverflow(plot, overflow)
+
+      drawn.forEach(({ thread, status }, i) => {
         const building = this._syncBuilding(thread, plot, i)
         seenBuildings.add(thread.id)
 
@@ -385,6 +394,27 @@ export class Colony {
     this.stats = { ...stats, done: stats.celebrating }
     this.astronauts.setRoster(roster, this._world())
     return this.stats
+  }
+
+  /**
+   * Put "+N more" on a zone's name plate. The plate is a canvas drawn once, so a change in the
+   * count means drawing it again; nothing else about the plot is touched. A rebuilt plot comes
+   * back with a plain plate and `overflow` unset, which is why this runs on every poll.
+   */
+  _setOverflow(plot, overflow) {
+    if ((plot.overflow ?? 0) === overflow) return
+    plot.overflow = overflow
+    if (!plot.label) return
+    const old = plot.label
+    this.labelGroup.remove(old)
+    old.userData.dispose?.()
+    const label = createLabel(overflow ? `${plot.name} · +${overflow} more` : plot.name, plot.accent)
+    label.position.copy(old.position)
+    // Carried over so a plate that is showing does not blink out and fade back in.
+    label.material.opacity = old.material.opacity
+    label.visible = old.visible
+    plot.label = label
+    this.labelGroup.add(label)
   }
 
   _syncPlots(projects) {

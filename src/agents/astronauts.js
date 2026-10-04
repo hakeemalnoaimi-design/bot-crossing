@@ -2,6 +2,7 @@ import * as THREE from 'three'
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js'
 import { buildFaceAtlas, FACE, FACE_LOOPS, FRAME_COLS, FRAME_ROWS } from './faces.js'
 import { attachMatrixAt, decorateSkinned, frameFor } from './crew.js'
+import { capRoster } from '../game/roster.js'
 
 /**
  * Every astronaut in the colony, drawn in a dozen instanced draws.
@@ -561,11 +562,14 @@ export class Astronauts {
     this.world = world || this.world
     const cap = Math.min(this.capacity, this.settings.get('maxAgents'))
     // Agents on their way back to the ship still hold a slot, so the roster has to leave room
-    // for them. Without this the clamp above would quietly drop whoever sorted last, which is
-    // better than an empty planet but still not what the scan said.
+    // for them.
     const leaving = this.agents.reduce((n, a) => n + (a.state === 'leaving' ? 1 : 0), 0)
-    const wanted = entries.slice(0, Math.max(1, cap - leaving))
+    // Over the cap, who is left out is decided by what each is asking for — a thread waiting on
+    // you outranks one that is merely idle — rather than by where the zones happened to sort.
+    const wanted = capRoster(entries, Math.max(1, cap - leaving))
     const seen = new Set()
+    /** Who has a builder right now, so the sidebar can tell drawn from asleep. */
+    this.drawn = new Set(wanted.map((e) => e.id))
 
     // The ramp is one door and the ship is a solid obstacle around it, so an entrance is a
     // queue. A handful arriving together is the shot the colony is for; a hundred is a scrum
@@ -589,6 +593,11 @@ export class Astronauts {
       if (!seen.has(agent.id) && agent.state !== 'leaving') this._sendHome(agent)
     }
     return this.agents.length
+  }
+
+  /** Does this thread have a builder on the island, as opposed to being over the cap? */
+  isDrawn(id) {
+    return this.drawn?.has(id) ?? false
   }
 
   _spawnAgent(entry, walksOut = true) {

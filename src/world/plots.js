@@ -81,7 +81,13 @@ const DECK_SKIRT = 0.4
 const DECK_HEIGHT = DECK_TOP + DECK_SKIRT
 /** Building slots per cell: one in the middle and six around it. */
 const SLOTS_PER_CELL = 7
+/**
+ * A zone's footprint stops here, and with it its capacity: 9 × 7 = 63 buildings. Raised, a big
+ * zone pushes the rest of the colony out past the flat ground (`COLONY_RADIUS`) and into the
+ * dunes, so the answer to a bigger roster is "+N more", not a bigger zone.
+ */
 const MAX_CELLS = 9
+export const ZONE_CAPACITY = MAX_CELLS * SLOTS_PER_CELL
 /** The lattice cell the ship owns. Nothing else may be placed there. */
 const SHIP_CELL = { q: -2, r: 1 }
 
@@ -726,8 +732,18 @@ export class Plot {
     return slots
   }
 
+  /** How many buildings this zone can hold. Past it, a thread has no building at all. */
+  get capacity() {
+    return this.slots.length
+  }
+
+  /**
+   * No wrap-around. It used to be `index % slots.length`, so thread 64 in a full zone was
+   * stacked inside thread 1's building and nothing said so. The colony fits a zone's threads
+   * to `capacity` before asking, and the ones that do not fit are reported as "+N more".
+   */
   slotFor(index) {
-    return this.slots[index % this.slots.length]
+    return this.slots[index]
   }
 
   worldSlot(index, out = new THREE.Vector3()) {

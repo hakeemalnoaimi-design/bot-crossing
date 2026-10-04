@@ -70,11 +70,18 @@ export class Hud {
 
     this.$ = (sel) => this.el.querySelector(sel)
 
+    this.health = null
+    this.coverage = null
+    this.asleepOpen = false
+
     this._buildStats()
     this._buildSettings()
     this._buildAvatar()
     this._wire()
     this.syncSettings()
+    // "Updated 12s ago" has to keep counting between polls, or it reads as fresh for as long as
+    // nothing changes — which is exactly when it matters.
+    setInterval(() => this._renderHealth(), 5000)
   }
 
   // ── construction ────────────────────────────────────────────────────────────────────
@@ -405,13 +412,70 @@ export class Hud {
   }
 
   /**
+   * "84 of 445 shown · 361 asleep", under the counters. Hidden when everything is on the map,
+   * because a line that always says "445 of 445" is a line nobody reads when it stops being true.
+   */
+  setCoverage(coverage) {
+    this.coverage = coverage
+    const el = this.$('.scan .coverage')
+    const partial = Boolean(coverage) && coverage.shown < coverage.total
+    const text = partial
+      ? `${coverage.shown} of ${coverage.total} shown · ${coverage.total - coverage.shown} ${coverage.asleep ? 'asleep' : 'not drawn'}`
+      : ''
+    if (this._last.coverage === text) return
+    this._last.coverage = text
+    el.textContent = text
+    el.hidden = !partial
+    el.title = partial
+      ? 'The rest have no builder: the crew is capped, or the zone is out of building slots. They are listed under Asleep in each zone.'
+      : ''
+  }
+
+  /**
+   * What the last poll said about itself: when it ran, which harnesses could not be read, and
+   * whether it failed outright. `ok: false` keeps the previous `scannedAt` and warnings, since
+   * the map is still showing that picture and the note's job is to say how old it is.
+   */
+  setHealth(next) {
+    const prev = this.health || {}
+    this.health = next.ok
+      ? { ok: true, warnings: next.warnings, scannedAt: next.scannedAt, stale: next.stale }
+      : { ...prev, ok: false, error: next.error }
+    this._renderHealth()
+  }
+
+  _renderHealth() {
+    const h = this.health
+    if (!h) return
+    const age = h.scannedAt ? Math.max(0, (Date.now() - h.scannedAt) / 1000) : null
+    const notes = []
+    if (!h.ok) notes.push(`Offline — ${h.error || 'no answer'}`)
+    if (age !== null) {
+      notes.push(h.ok ? `updated ${age < 5 ? 'just now' : `${duration(age)} ago`}` : `showing the scan from ${duration(age)} ago`)
+    }
+    if (h.ok && h.stale) notes.push('some n8n data is out of date')
+    const amber = !h.ok || (age !== null && age > 60) || Boolean(h.stale)
+    const warnings = h.warnings || []
+    const signature = `${notes.join('|')}~${amber}~${warnings.join('|')}`
+    if (this._last.health === signature) return
+    this._last.health = signature
+
+    const fresh = this.$('.scan .fresh')
+    fresh.textContent = notes.join(' · ')
+    fresh.classList.toggle('amber', amber)
+    const warns = this.$('.scan .warns')
+    warns.innerHTML = warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')
+    warns.hidden = warnings.length === 0
+  }
+
+  /**
    * Every repo, in the sidebar. This was a strip of chips along the bottom of the screen;
    * it is a list now because the sidebar is where all the chrome lives, and because a list
    * can carry a count and an alarm without running out of room at eleven repos.
    */
   setLegend(projects, activeName = null, hidden = [], folded = []) {
     const signature =
-      projects.map((p) => `${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') +
+      projects.map((p) => `${p.name}:${p.drawn}/${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') +
       `~${activeName}~` +
       hidden.map((p) => `${p.name}:${p.count}`).join('|') +
       `~${folded.length}`
@@ -424,13 +488,16 @@ export class Hud {
       const b = document.createElement('button')
       b.type = 'button'
       b.className = 'repo'
-      b.title = `${p.count} thread${p.count === 1 ? '' : 's'} in ${p.name}`
+      const partial = p.drawn !== undefined && p.drawn < p.count
+      b.title = partial
+        ? `${p.drawn} of ${p.count} threads drawn in ${p.name}`
+        : `${p.count} thread${p.count === 1 ? '' : 's'} in ${p.name}`
       b.setAttribute('aria-pressed', String(p.name === activeName))
       b.innerHTML =
         `<i class="swatch" style="background:${hex(p.accent)};color:${hex(p.accent)}"></i>` +
         `<span class="n">${escapeHtml(p.name)}</span>` +
         (p.urgent ? '<i class="alarm"></i>' : '') +
-        `<span class="count">${p.count}</span>`
+        `<span class="count">${partial ? `${p.drawn} / ${p.count}` : p.count}</span>`
       b.addEventListener('click', () => this.actions.pickProject?.(p.name))
       wrap.appendChild(b)
     }
@@ -518,7 +585,8 @@ export class Hud {
     // you leave the panel open.
     const signature =
       `${project.name}~${project.path}~${project.accent}~${project.selectedId}~${Math.floor(Date.now() / 60000)}~` +
-      project.threads.map((t) => `${t.id}:${t.status}:${t.title}:${t.lastActivityAt}`).join('|')
+      `${this.asleepOpen ? 1 : 0}~` +
+      project.threads.map((t) => `${t.id}:${t.status}:${t.title}:${t.lastActivityAt}:${t.lastRunAt}:${t.drawn ? 1 : 0}`).join('|')
     panel.classList.add('drilled')
     if (this._last.project === signature) return
     this._last.project = signature
@@ -535,17 +603,22 @@ export class Hud {
     this.$('#btn-reveal').disabled = !project.path
     this.$('#btn-copy-path').disabled = !project.path
 
+    // Only threads with a builder get a row that can fly anywhere. The rest go in a group of
+    // their own, below, where the row does the one thing it can.
+    const drawn = project.threads.filter((t) => t.drawn)
+    const asleep = project.threads.filter((t) => !t.drawn)
     const n = project.threads.length
     const waiting = project.threads.filter((t) => t.status === 'waiting' || t.status === 'blocked').length
     this.$('.side .threads-head').innerHTML =
-      `<span>${n} thread${n === 1 ? '' : 's'}</span>` + (waiting ? `<span class="want">${waiting} need you</span>` : '')
+      `<span>${asleep.length ? `${drawn.length} / ${n}` : n} thread${n === 1 ? '' : 's'}</span>` +
+      (waiting ? `<span class="want">${waiting} need you</span>` : '')
 
     const list = this.$('.side .threads')
     // A poll rewrites these rows every time a live thread's timestamp moves. Losing your
     // place in a forty-thread repo every fifteen seconds would make the list unusable.
     const scroll = list.scrollTop
     list.innerHTML = ''
-    for (const t of project.threads) {
+    for (const t of drawn) {
       const b = document.createElement('button')
       b.type = 'button'
       b.className = `thread ${statusClass(t.status)}`
@@ -554,7 +627,7 @@ export class Hud {
       b.innerHTML =
         '<i class="pip"></i>' +
         `<span class="t">${escapeHtml(t.title || 'Untitled thread')}</span>` +
-        `<span class="when">${ago(t.lastActivityAt)}</span>` +
+        `<span class="when">${whenLabel(t)}</span>` +
         (t.worktree ? `<span class="wt">⑂ ${escapeHtml(t.worktree)}</span>` : '')
       b.addEventListener('click', () => this.actions.focusThread?.(t.id))
       list.appendChild(b)
@@ -571,6 +644,36 @@ export class Hud {
           if (top < list.scrollTop) list.scrollTop = top
           else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight
         })
+      }
+    }
+
+    if (asleep.length) {
+      const toggle = document.createElement('button')
+      toggle.type = 'button'
+      toggle.className = 'asleep-toggle'
+      toggle.setAttribute('aria-expanded', String(this.asleepOpen))
+      toggle.title = 'Threads with no builder on the island — the crew is capped, or this zone is out of building slots'
+      toggle.innerHTML = `<span>Asleep (${asleep.length})</span>`
+      toggle.addEventListener('click', () => {
+        this.asleepOpen = !this.asleepOpen
+        // The signature carries the open state, so this repaints the list and nothing else.
+        this.setProject(this.project)
+      })
+      list.appendChild(toggle)
+      if (this.asleepOpen) {
+        for (const t of asleep) {
+          const row = document.createElement('button')
+          row.type = 'button'
+          row.className = 'thread asleep'
+          row.title = `No builder on the island — open in ${t.harness || 'its harness'}`
+          row.innerHTML =
+            '<i class="pip"></i>' +
+            `<span class="t">${escapeHtml(t.title || 'Untitled thread')}</span>` +
+            `<span class="when">${whenLabel(t)}</span>` +
+            '<span class="open">Open</span>'
+          row.addEventListener('click', () => this.actions.openById?.(t.id))
+          list.appendChild(row)
+        }
       }
     }
     list.scrollTop = scroll
@@ -604,7 +707,7 @@ export class Hud {
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
     if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
-    bits.push(`<span>${ago(thread.lastActivityAt)}</span>`)
+    bits.push(`<span>${whenLabel(thread)}</span>`)
     meta.innerHTML = bits.join('')
 
     const pct = Math.round((this.actions.progressFor?.(thread.id) ?? 0) * 100)
@@ -912,6 +1015,27 @@ function nearestTime(value) {
   return bestD < 0.03 ? best.id : null
 }
 
+/**
+ * When a thread last did something, as a person would say it.
+ *
+ * An n8n workflow's `lastActivityAt` is adjusted so it lands on the right side of the dormancy
+ * line — a switched-off one is pushed days back, an active one with no run left on record is
+ * floated to just inside it — which makes it a fine sort key and a false thing to print. The
+ * adapter keeps the real time in `lastRunAt`, and `null` there means there is none.
+ */
+function whenLabel(t) {
+  if (t.lastRunAt) return `last run ${ago(t.lastRunAt)}`
+  if (t.harness === 'n8n' && t.lastRunAt === null) return 'never run on record'
+  return ago(t.lastActivityAt)
+}
+
+/** A span of seconds, as short as it can be: 40s, 3m, 2h. */
+function duration(s) {
+  if (s < 60) return `${Math.floor(s)}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  return `${Math.floor(s / 3600)}h`
+}
+
 function ago(ts) {
   if (!ts) return 'never'
   const s = Math.max(0, (Date.now() - ts) / 1000)
@@ -932,6 +1056,11 @@ const TEMPLATE = `
   </header>
 
   <div class="stats"></div>
+  <div class="scan">
+    <div class="coverage" hidden></div>
+    <div class="fresh"></div>
+    <ul class="warns" hidden></ul>
+  </div>
 
   <div class="side-body">
     <div class="projects-pane">

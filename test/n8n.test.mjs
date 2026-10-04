@@ -17,19 +17,50 @@ import path from 'node:path'
 
 const DAY = 24 * 60 * 60 * 1000
 
-/** A stub n8n. Records what it was asked for, so the adapter's requests can be asserted on. */
-async function fakeN8n({ workflows = [], executions = [], fail = null } = {}) {
+/**
+ * A stub n8n. Records what it was asked for, so the adapter's requests can be asserted on.
+ *
+ * `config` is live: a test can flip `fail`, `failHeaders` or `hang` between polls. `windowSize`
+ * models the real instance's newest-first executions, so a test can put a run outside the window;
+ * `delayMs` holds each answer a moment so concurrency can be measured.
+ */
+async function fakeN8n({ workflows = [], executions = [], fail = null, ...rest } = {}) {
+  const config = { fail, failHeaders: {}, hang: false, windowSize: null, delayMs: 0, ...rest }
   const seen = []
-  const server = http.createServer((req, res) => {
+  let inFlight = 0
+  let maxInFlight = 0
+  const newest = (rows) => [...rows].sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))
+  const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
-    seen.push({ path: url.pathname, method: req.method, key: req.headers['x-n8n-api-key'] })
-    if (fail) {
-      res.writeHead(fail).end('{}')
+    seen.push({
+      path: url.pathname,
+      query: url.searchParams,
+      method: req.method,
+      key: req.headers['x-n8n-api-key'],
+    })
+    if (config.hang) return // never answered, like a dropped host
+    inFlight++
+    maxInFlight = Math.max(maxInFlight, inFlight)
+    if (config.delayMs) await new Promise((r) => setTimeout(r, config.delayMs))
+    inFlight--
+    if (config.fail) {
+      res.writeHead(config.fail, config.failHeaders).end('{}')
       return
     }
     const json = (body) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
     if (url.pathname === '/api/v1/workflows') return json({ data: workflows, nextCursor: null })
-    if (url.pathname === '/api/v1/executions') return json({ data: executions, nextCursor: null })
+    if (url.pathname === '/api/v1/executions') {
+      let rows = executions
+      const q = url.searchParams
+      if (q.get('workflowId')) rows = newest(rows.filter((e) => e.workflowId === q.get('workflowId')))
+      else if (q.get('status')) rows = newest(rows.filter((e) => e.status === q.get('status')))
+      else if (config.windowSize) rows = newest(rows).slice(0, config.windowSize)
+      const filtered = q.get('workflowId') || q.get('status')
+      return json({
+        data: rows.slice(0, Number(q.get('limit')) || rows.length),
+        nextCursor: filtered ? null : (config.nextCursor ?? null),
+      })
+    }
     const one = /^\/api\/v1\/executions\/(\d+)$/.exec(url.pathname)
     if (one && req.method === 'GET') {
       const found = executions.find((e) => String(e.id) === one[1])
@@ -43,6 +74,10 @@ async function fakeN8n({ workflows = [], executions = [], fail = null } = {}) {
   return {
     base,
     seen,
+    config,
+    get maxInFlight() {
+      return maxInFlight
+    },
     // `fetch` pools its sockets and keeps them alive, and `close()` waits for every one of
     // them — so without this the whole run hangs at the end of the first test rather than
     // failing. Dropping the connections is what actually lets the server shut down.
@@ -237,7 +272,7 @@ test('a live workflow with no run left on record is idle, not asleep', async () 
 
   const live = byId.get('n8n:live')
   assert.ok(now - live.lastActivityAt < 3 * DAY, 'switched on reads as awake')
-  assert.equal(live.lastRunAt, 0, 'and does not invent a run that never happened')
+  assert.equal(live.lastRunAt, null, 'and does not invent a run that never happened')
   assert.match(live.preview, /no run left on record/i, 'the card says what is actually known')
 
   // Switched off is still dormant — the change is only about live ones.
@@ -470,6 +505,256 @@ test('a rejected key says so rather than looking like an empty instance', async 
   const { harness, cleanup } = await adapterFor(stub.base)
   await harness.scanThreads()
   assert.match(await harness.diagnostic(), /API key was rejected/)
+  await stub.close()
+  await cleanup()
+})
+
+// ── what the window cannot see ────────────────────────────────────────────────
+
+const sleep = (n) => new Promise((r) => setTimeout(r, n))
+/** The adapter finishes some work after a scan returns; poll for it rather than guess a delay. */
+async function until(check, what, limit = 4000) {
+  const start = Date.now()
+  while (Date.now() - start < limit) {
+    if (await check()) return
+    await sleep(25)
+  }
+  assert.fail(`timed out waiting for ${what}`)
+}
+const lookupsOf = (stub) => stub.seen.filter((c) => c.query.get('workflowId'))
+const windowReads = (stub) =>
+  stub.seen.filter((c) => c.path === '/api/v1/executions' && !c.query.get('status') && !c.query.get('workflowId'))
+
+test('a failure older than the execution window still gets its !', async () => {
+  // Measured live: 53 of 76 active workflows had no run in the newest 250. A rarely-run workflow
+  // that fails drops out of that window within hours and would otherwise look perfectly healthy.
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'rare' }), workflow({ id: 'busy' })],
+    executions: [
+      execution({ id: '1', workflowId: 'rare', status: 'error', startedAt: ago(5 * DAY), stoppedAt: ago(5 * DAY) }),
+      execution({ id: '2', workflowId: 'busy', startedAt: ago(3000) }),
+      execution({ id: '3', workflowId: 'busy', startedAt: ago(2000) }),
+    ],
+    windowSize: 2,
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  const byId = new Map((await harness.scanThreads()).map((t) => [t.id, t]))
+
+  assert.equal(windowReads(stub).length, 1)
+  assert.ok(stub.seen.some((c) => c.query.get('status') === 'error'), 'failures were asked for on their own')
+  assert.equal(byId.get('n8n:rare').hasError, true, 'the failure the window missed is shown')
+  assert.equal(byId.get('n8n:rare').canRetry, true)
+  assert.equal(byId.get('n8n:busy').hasError, false, 'and a healthy neighbour is untouched')
+  await stub.close()
+  await cleanup()
+})
+
+test('a live workflow nothing else saw is looked up, cached, and never more than four at once', async () => {
+  const gaps = Array.from({ length: 20 }, (_, i) => `g${i}`)
+  const stub = await fakeN8n({
+    workflows: [workflow({ id: 'busy' }), ...gaps.map((id) => workflow({ id }))],
+    executions: [
+      execution({ id: '1', workflowId: 'busy', startedAt: ago(1000) }),
+      ...gaps.map((id, i) =>
+        execution({ id: String(100 + i), workflowId: id, startedAt: ago(5 * DAY), stoppedAt: ago(5 * DAY) })
+      ),
+    ],
+    windowSize: 1,
+    delayMs: 40,
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  await until(() => lookupsOf(stub).length === 16, 'the first batch of lookups')
+  await sleep(250)
+  assert.equal(lookupsOf(stub).length, 16, 'one refresh asks about sixteen, not twenty')
+  assert.ok(stub.maxInFlight <= 4, `at most four requests at once (saw ${stub.maxInFlight})`)
+  assert.ok(stub.maxInFlight > 1, 'and they do run side by side')
+
+  const byId = new Map((await harness.scanThreads()).map((t) => [t.id, t]))
+  assert.ok(byId.get('n8n:g0').lastRunAt > Date.now() - 6 * DAY, 'the lookup filled the gap')
+  assert.ok(byId.get('n8n:g0').lastRunAt < Date.now() - 4 * DAY)
+  assert.equal(byId.get('n8n:g19').lastRunAt, null, 'the rest are still waiting their turn')
+
+  // The next poll picks up the remainder and does not ask about the ones it already knows.
+  await sleep(1100)
+  await harness.scanThreads()
+  await until(() => lookupsOf(stub).length === 20, 'the remaining lookups')
+  await sleep(1100)
+  await harness.scanThreads()
+  await sleep(400)
+  assert.equal(lookupsOf(stub).length, 20, 'answers are cached, not re-asked every poll')
+  assert.ok(stub.maxInFlight <= 4)
+  await stub.close()
+  await cleanup()
+})
+
+test('a lookup that finds nothing is cached too', async () => {
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'never' })], executions: [] })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  await until(() => lookupsOf(stub).length === 1, 'the lookup')
+  await sleep(1100)
+  await harness.scanThreads()
+  await sleep(300)
+  assert.equal(lookupsOf(stub).length, 1, 'no run on record is an answer, not a reason to ask again')
+  await stub.close()
+  await cleanup()
+})
+
+test('history that continues past the pages read is not a standing warning', async () => {
+  // n8n always has older runs, so this would be on forever; the gaps are filled by lookups.
+  const many = Array.from({ length: 250 }, (_, i) =>
+    execution({ id: String(1000 + i), workflowId: 'w', startedAt: ago(i * 1000) })
+  )
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'w' })], executions: many, nextCursor: 'more' })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  assert.equal(await harness.diagnostic(), '')
+  await stub.close()
+  await cleanup()
+})
+
+// ── never stalling ────────────────────────────────────────────────────────────
+
+test('a first refresh that fails does not make the next poll wait on n8n', async () => {
+  const stub = await fakeN8n({ fail: 500 })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  assert.deepEqual(await harness.scanThreads(), [])
+
+  // Past the backoff, and now the host has gone quiet — the old behaviour was to wait it out.
+  stub.config.fail = null
+  stub.config.hang = true
+  await sleep(2100)
+  const before = stub.seen.length
+  const started = Date.now()
+  const threads = await harness.scanThreads()
+  assert.ok(Date.now() - started < 500, 'answered at once')
+  assert.deepEqual(threads, [])
+  await until(() => stub.seen.length > before, 'the refresh to start in the background')
+  const again = Date.now()
+  await harness.scanThreads()
+  assert.ok(Date.now() - again < 500, 'and a poll during a hung refresh does not wait either')
+  await stub.close()
+  await cleanup()
+})
+
+test('a failed refresh keeps the last good threads and says how old they are', async () => {
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'w' })], executions: [execution({ workflowId: 'w' })] })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  const [good] = await harness.scanThreads()
+  assert.equal(good.staleSince, null, 'fresh data is not stale')
+
+  stub.config.fail = 500
+  await sleep(1100)
+  await harness.scanThreads()
+  await until(async () => /500/.test(await harness.diagnostic()), 'the failure to be reported')
+  const threads = await harness.scanThreads()
+  assert.equal(threads.length, 1, 'the last good thread is still there')
+  assert.ok(threads[0].staleSince > Date.now() - 10_000, 'stamped with when it was last read')
+  assert.match(await harness.diagnostic(), /showing n8n as it was .* ago/)
+
+  stub.config.fail = null
+  await sleep(2100) // out of the backoff
+  await harness.scanThreads()
+  await until(async () => (await harness.scanThreads())[0].staleSince === null, 'recovery')
+  assert.doesNotMatch(await harness.diagnostic(), /500/)
+  await stub.close()
+  await cleanup()
+})
+
+test('a 429 with Retry-After leaves n8n alone until it is over', async () => {
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'w' })], executions: [execution({ workflowId: 'w' })] })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+
+  stub.config.fail = 429
+  stub.config.failHeaders = { 'retry-after': '120' }
+  await sleep(1100)
+  await harness.scanThreads()
+  await until(async () => /429/.test(await harness.diagnostic()), 'the 429 to be reported')
+  assert.match(await harness.diagnostic(), /next try in 2 min/, 'the wait is visible')
+
+  stub.config.fail = null
+  const before = stub.seen.length
+  await sleep(1100) // well past a poll, nowhere near two minutes
+  await harness.scanThreads()
+  await sleep(200)
+  assert.equal(stub.seen.length, before, 'no request while the instance asked for quiet')
+  assert.equal((await harness.scanThreads()).length, 1, 'and the map still has its threads')
+  await stub.close()
+  await cleanup()
+})
+
+test('without a Retry-After the backoff grows rather than polling every interval', async () => {
+  const stub = await fakeN8n({ fail: 503 })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  await sleep(1100) // a poll later, but still inside the 2 s backoff of a first failure
+  const before = stub.seen.length
+  await harness.scanThreads()
+  await sleep(100)
+  assert.equal(stub.seen.length, before, 'a poll inside the backoff does not call n8n')
+  assert.match(await harness.diagnostic(), /next try in/)
+  await stub.close()
+  await cleanup()
+})
+
+// ── payload weight ────────────────────────────────────────────────────────────
+
+test('the workflow list is not re-read inside its refresh window, and drops pinned data', async () => {
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'w' })], executions: [execution({ workflowId: 'w' })] })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  await harness.scanThreads()
+  await sleep(1100)
+  await harness.scanThreads()
+  await until(() => windowReads(stub).length === 2, 'a second executions refresh')
+
+  const listReads = stub.seen.filter((c) => c.path === '/api/v1/workflows')
+  assert.equal(listReads.length, 1, 'executions moved on, the workflow list did not')
+  assert.equal(listReads[0].query.get('excludePinnedData'), 'true')
+  await stub.close()
+  await cleanup()
+})
+
+test('the workflow list is re-read once its own window has passed', async () => {
+  const stub = await fakeN8n({ workflows: [workflow({ id: 'w' })], executions: [execution({ workflowId: 'w' })] })
+  const { harness, cleanup } = await adapterFor(stub.base, { N8N_WORKFLOW_REFRESH_SECONDS: 1 })
+  await harness.scanThreads()
+  await sleep(1100)
+  await harness.scanThreads()
+  await until(() => stub.seen.filter((c) => c.path === '/api/v1/workflows').length === 2, 'a second list read')
+  await stub.close()
+  await cleanup()
+})
+
+// ── the real last run ─────────────────────────────────────────────────────────
+
+test('lastRunAt is the real time of the latest run, apart from lastActivityAt', async () => {
+  const started = ago(10 * 60_000)
+  const stopped = ago(9 * 60_000)
+  const stub = await fakeN8n({
+    workflows: [
+      workflow({ id: 'done' }),
+      workflow({ id: 'going' }),
+      workflow({ id: 'none' }),
+      workflow({ id: 'off', active: false }),
+    ],
+    executions: [
+      execution({ id: '1', workflowId: 'done', startedAt: started, stoppedAt: stopped }),
+      execution({ id: '2', workflowId: 'going', status: 'running', startedAt: started, stoppedAt: null }),
+      execution({ id: '3', workflowId: 'off', startedAt: stopped, stoppedAt: stopped }),
+    ],
+  })
+  const { harness, cleanup } = await adapterFor(stub.base)
+  const byId = new Map((await harness.scanThreads()).map((t) => [t.id, t]))
+
+  assert.equal(byId.get('n8n:done').lastRunAt, Date.parse(stopped), 'finished: when it stopped')
+  assert.equal(byId.get('n8n:going').lastRunAt, Date.parse(started), 'still running: when it started')
+  assert.equal(byId.get('n8n:none').lastRunAt, null, 'never seen: null, not 0')
+  // A switched-off workflow keeps its true time while `lastActivityAt` is pushed past the line.
+  assert.equal(byId.get('n8n:off').lastRunAt, Date.parse(stopped))
+  assert.ok(Date.now() - byId.get('n8n:off').lastActivityAt > 3 * DAY, 'activity says asleep')
+  assert.ok(Date.now() - byId.get('n8n:off').lastRunAt < DAY, 'while the real run was minutes ago')
   await stub.close()
   await cleanup()
 })

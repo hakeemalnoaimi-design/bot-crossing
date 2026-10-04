@@ -96,6 +96,8 @@ what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map
 | `sizeBytes` | number | Transcript size. **This is how finished a building looks**, on a log scale |
 | `source` | string | Free-form, for your own bookkeeping (the Claude adapter uses `desktop` / `cli`) |
 | `canOpen` | boolean | Whether this thread can be opened. The UI greys the button out |
+| `lastRunAt` | number \| null | Optional. Epoch ms of the thread's real latest run, or `null` if none was seen. Unlike `lastActivityAt` it is never adjusted for sorting or dormancy — n8n pushes `lastActivityAt` around, `lastRunAt` is the truth to display |
+| `staleSince` | number \| null | Optional. Epoch ms of the last *successful* read, when what is shown is older than the latest attempt (the source failed or is backing off); `null` when current. Drawn from the last good data rather than hidden |
 | `ref` | object | **Opaque.** Whatever *you* need to find this thread again |
 
 ### About `ref`
