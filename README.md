@@ -312,17 +312,23 @@ under **View → Return to isometric**.
 | --- | --- |
 | `H` / `⌘\` | **Hide every panel.** The island still reads: status lives above the builders' heads |
 | `S` | Settings |
+| `/` | Search threads across every zone |
 | `N` | Fly to the next builder waiting on you |
-| `Enter` / `A` | Open / archive the selected thread |
+| `Enter` / `A` | Open / archive the selected thread (archive has a 5 s undo) |
+| `U` | Unarchive |
+| `R` | Retry a failed n8n run — asks first, and only the latest failure |
 | `V` | Mark the selected thread viewed, so it stops asking |
 | `C` | New conversation in the open zone's folder |
 | `O` | Orbit mode |
-| `Tab` | Next world |
+| `W` | Next world (not `Tab`, which moves through the panels) |
 | `L` | Next time of day |
 | `P` | Screenshot |
 | `0` | Reset the view |
-| `Esc` | Deselect, and close the zone sidebar |
+| `Esc` | Clear search, close Settings, deselect, close the zone sidebar |
 | `?` | Help |
+
+Shortcuts are ignored while a button, field or panel has focus, so `Enter` on a focused
+button presses that button and nothing else.
 
 ## Worlds and light
 

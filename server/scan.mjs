@@ -110,7 +110,7 @@ export async function defaultHarness() {
 
 const dispatch = (harnessId) => {
   const h = harnessById(harnessId)
-  if (!h) throw new Error(`Unknown harness "${harnessId}"`)
+  if (!h) throw Object.assign(new Error(`Unknown harness "${harnessId}"`), { status: 400 })
   return h
 }
 

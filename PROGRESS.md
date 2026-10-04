@@ -40,7 +40,7 @@ renamed). The parent folder `Botsbay-world/` is not a git repository.
 ```bash
 npm install
 npm run dev          # the whole thing: the API runs inside the Vite dev server, port 5274
-npm test             # 63 tests, all passing
+npm test             # 159 tests, all passing
 npm run smoke        # draws every preset/world/time/distance and reads the pixels back
 npm run profile      # GPU timer-query profile of a frame, feature by feature
 npm run shot -- --out=shots --preset=high --time=0.42,0.94 --views=overview,wide,pad
@@ -78,6 +78,10 @@ Each part is a separate commit so any one of them can be reverted on its own.
 | `6289f01` | **Part C** — lighting |
 | `b6dc3fa` | **Part D** — identity rename |
 | `f87aa3f` | Fix a black canvas on the High and Ultra presets |
+| `0511dcd` | **Phase 1** — server hardening and a safe Retry (branch `botsbay-fixes`) |
+| `8e2c4ed` | **Phase 2** — the map shows what needs attention, and never stalls |
+| `cf58c6a` | **Phase 3** — dashboard HUD, accessibility, readable night, context loss |
+| Phase 4 | Layout fits the flat island, window panes, test coverage, CI |
 
 ---
 
@@ -313,6 +317,33 @@ way: the same pixels come back under Balanced and High to within 2/255.
 
 **`npm run smoke` exists because of this bug.** Nothing short of drawing a frame and reading the
 pixels back could have caught it. Run it after any renderer change.
+
+---
+
+## Phases 1–4 — review fixes (branch `botsbay-fixes`)
+
+A review against the live instance (~440 threads, 17 zones, against a design for 40–65) found
+the map could hide exactly what it is for. Each phase is one commit; the messages carry the
+detail. What a later session most needs to know:
+
+- **The Origin check compares host *and port*.** Before, any other app on localhost could drive
+  the write routes. UNC paths are refused before any fs call (they make Windows send NTLM
+  hashes to the share). See `test/security.test.mjs`.
+- **Retry never trusts the client's execution id.** It is taken from the adapter's snapshot,
+  only for a failed latest run, once (in-flight lock, retried memory, `retrySuccessId`).
+- **An unreadable `colony.json` is quarantined, not treated as empty.** Writes are refused
+  until it is fixed; `/api/threads` still answers so the island does not empty.
+- **n8n failures outside the execution window are found** via `status=error` and capped,
+  cached per-workflow lookups. History running past the pages read is deliberately *not* a
+  warning: it is always true, and an always-on warning buries the real ones.
+- **The builder cap picks by urgency** (`src/game/roster.js`), and a full zone says "+N more"
+  instead of stacking buildings on one slot. The flat radius and nav grid follow the layout.
+- **World switch moved from `Tab` to `W`** so keyboard users can reach the panels.
+- **The white slabs at night** were the window glow on the whole accent swatch; it is panes now.
+- **Not done, on purpose:** instancing buildings (~80 drawn, ~2.5 ms measured — not worth the
+  risk) and diffing the poll payload (314 KB over loopback costs nothing).
+- **CI** (`.github/workflows/ci.yml`) runs tests and build on Windows and Linux. Smoke stays
+  manual: it needs a GPU.
 
 ---
 

@@ -377,6 +377,7 @@ function readJsonBody(req, limit = 4 * 1024 * 1024) {
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
       } catch (err) {
+        err.status = 400
         reject(err)
       }
     })
@@ -477,6 +478,7 @@ export async function apiMiddleware(req, res, next) {
 
     return send(res, 404, { error: 'Unknown endpoint' })
   } catch (err) {
-    return send(res, 500, { error: String(err && err.message ? err.message : err) })
+    // A bad request (unparseable body, unknown harness) is the caller's mistake, not ours.
+    return send(res, err?.status || 500, { error: String(err && err.message ? err.message : err) })
   }
 }

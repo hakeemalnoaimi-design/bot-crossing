@@ -279,6 +279,7 @@ function decorate(material, uniforms) {
          varying vec2 vAtlasUv;
          varying float vLocalY;
          varying vec2 vLocalXZ;
+         varying float vLocalNY;
          uniform float uProgress;
          uniform float uMaxY;
          uniform float uMinY;
@@ -296,7 +297,8 @@ function decorate(material, uniforms) {
       .replace(
         '#include <beginnormal_vertex>',
         `#include <beginnormal_vertex>
-         if ( aSpin > 0.0 ) objectNormal = botSpin( objectNormal, vec3( 0.0 ), uTime * aSpin );`
+         if ( aSpin > 0.0 ) objectNormal = botSpin( objectNormal, vec3( 0.0 ), uTime * aSpin );
+         vLocalNY = objectNormal.y;`
       )
       .replace(
         '#include <begin_vertex>',
@@ -324,6 +326,7 @@ function decorate(material, uniforms) {
          varying vec2 vAtlasUv;
          varying float vLocalY;
          varying vec2 vLocalXZ;
+         varying float vLocalNY;
          uniform float uProgress;
          uniform float uMaxY;
          uniform float uMinY;
@@ -386,8 +389,15 @@ function decorate(material, uniforms) {
          // lit pane with dark wall between it and the next, so the emission is broken into
          // panes along the wall (the two weights are off the octagon's 45-degree edges, so no
          // face is left with a constant phase) and the rest of the band keeps its shading.
-         float along = fract( vLocalXZ.x * 4.1 + vLocalXZ.y * 2.6 );
-         float pane = smoothstep( 0.34, 0.40, along ) * ( 1.0 - smoothstep( 0.52, 0.58, along ) );
+         //
+         // They used to be ~0.2 units apart, which at any distance is a barcode. Now they are a
+         // row of windows: about half a unit wide with a clear gap of the same again between,
+         // in one band at a time up the wall, and only on the wall — the normal says whether this
+         // is a side or a curved roof, and a dome's crown gets no panes at all.
+         float along = fract( vLocalXZ.x * 0.9 + vLocalXZ.y * 0.55 );
+         float pane = smoothstep( 0.12, 0.17, along ) * ( 1.0 - smoothstep( 0.52, 0.57, along ) );
+         float row = smoothstep( 0.18, 0.24, fract( vLocalY * 0.8 + 0.1 ) ) * ( 1.0 - smoothstep( 0.62, 0.68, fract( vLocalY * 0.8 + 0.1 ) ) );
+         pane *= row * ( 1.0 - smoothstep( 0.2, 0.45, abs( vLocalNY ) ) );
          vec3 lampTint = mix( uAccent, vec3( 1.0, 0.76, 0.46 ), 0.6 );
          totalEmissiveRadiance += lampTint * uCellAccent[ cell ] * uLit * ( 0.03 + 0.9 * pane );
          // The construction line: a bright band riding just above the ground it rises from.

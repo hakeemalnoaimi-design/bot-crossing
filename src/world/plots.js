@@ -92,8 +92,9 @@ const DECK_HEIGHT = DECK_TOP + DECK_SKIRT
 const SLOTS_PER_CELL = 7
 /**
  * A zone's footprint stops here, and with it its capacity: 9 × 7 = 63 buildings. Raised, a big
- * zone pushes the rest of the colony out past the flat ground (`COLONY_RADIUS`) and into the
- * dunes, so the answer to a bigger roster is "+N more", not a bigger zone.
+ * zone pushes the rest of the colony out past the flat ground and into the dunes, so the answer
+ * to a bigger roster is "+N more", not a bigger zone. The count that sizes a zone is what will be
+ * *drawn* (folded dormant threads are gone before it is asked), not the repo's total.
  */
 const MAX_CELLS = 9
 export const ZONE_CAPACITY = MAX_CELLS * SLOTS_PER_CELL
@@ -238,18 +239,68 @@ function isConnected(out) {
   return seen.size === cells.size
 }
 
-export function allocateCells(projects, previous = new Map()) {
-  const laid = layOut(projects, previous)
+/**
+ * How far out a cell *centre* may sit so that its whole tile still lies on flat ground whose
+ * radius is `limit`: a tile reaches `CELL` past its centre, and the terrain needs a little
+ * more than that before it starts to rise.
+ */
+export const layoutReach = (limit) => limit - CELL - 2
+
+/**
+ * How far the outermost corner of any tile in a layout is from the middle of the map — the
+ * number the flat ground and the walkable grid are sized from.
+ */
+export function layoutExtent(layout) {
+  let far = 0
+  for (const [, cells] of layout) {
+    for (const { q, r } of cells) {
+      const { x, z } = hexToWorld(q, r)
+      far = Math.max(far, Math.hypot(x, z) + CELL)
+    }
+  }
+  return far
+}
+
+/**
+ * @param reach the furthest a cell centre may be from the middle (see `layoutReach`). Left
+ *   out, the lattice is unbounded and a roster simply sprawls.
+ */
+export function allocateCells(projects, previous = new Map(), reach = Infinity) {
+  const laid = layOut(projects, previous, reach)
   // Remembering where a zone sat is worth a great deal, right up until it leaves the colony
   // as scattered islands. Then the memory is describing a map that no longer exists, and
   // starting over — compact, from the middle, the way a first run does it — is the lesser
   // upheaval. It only happens when the alternative is visibly broken.
-  return isConnected(laid) ? laid : layOut(projects, new Map())
+  return isConnected(laid) ? laid : layOut(projects, new Map(), reach)
 }
 
-function layOut(projects, previous) {
+function layOut(projects, previous, reach) {
   const reserved = key(SHIP_CELL.q, SHIP_CELL.r)
+  const inReach = (c) => {
+    const { x, z } = hexToWorld(c.q, c.r)
+    return Math.hypot(x, z) <= reach
+  }
   const wanted = projects.map((p) => ({ id: p.id, want: cellsNeeded(p.size) }))
+
+  // Bounded ground holds only so many tiles. When the roster wants more, the biggest zones give
+  // up a tile at a time until it fits — a zone is packed tighter, and its last threads become
+  // "+N more" — rather than a ring of tiles being laid out on the dunes. A fifth is held back
+  // so a blob is never hemmed in by its neighbours with nowhere left to grow.
+  if (Number.isFinite(reach)) {
+    let room = 0
+    for (let ring = 0; ring < 12; ring++) {
+      for (const cell of hexRing(ring)) if (key(cell.q, cell.r) !== reserved && inReach(cell)) room++
+    }
+    const budget = Math.floor(room * 0.8)
+    let spent = wanted.reduce((n, w) => n + w.want, 0)
+    while (spent > budget) {
+      let big = null
+      for (const w of wanted) if (w.want > 1 && (!big || w.want >= big.want)) big = w
+      if (!big) break
+      big.want--
+      spent--
+    }
+  }
   const total = wanted.reduce((n, w) => n + w.want, 0)
 
   // Spiral order decides where a *new* project settles. The pool runs past what is needed
@@ -268,7 +319,7 @@ function layOut(projects, previous) {
   for (let ring = 0; (pool.length < total + 30 || ring <= farthest) && ring < 12; ring++) {
     for (const cell of hexRing(ring)) {
       const k = key(cell.q, cell.r)
-      if (k === reserved) continue
+      if (k === reserved || !inReach(cell)) continue
       pool.push(cell)
       free.add(k)
     }
@@ -281,11 +332,15 @@ function layOut(projects, previous) {
     // The root cell is the whole point — it is the zone's origin, and everything standing
     // on the zone is placed relative to it. A blob that loses its root has *moved*, so if
     // the root is gone this project is seeded afresh rather than quietly re-rooted onto
-    // whichever of its old cells happens to still be free.
+    // whichever of its old cells happens to still be free. The same goes for a root that has
+    // fallen outside the flat ground: it is not in `free`, so the zone is seeded afresh.
     if (!free.has(key(before[0].q, before[0].r))) continue
     const keep = []
     for (const cell of before) {
       if (keep.length >= want) break // shrunk: whatever it claimed last is what it gives up
+      // Past the flat ground the rest of the list is lost with it — claimed last, given up
+      // first — and the blob grows back inside rather than skipping over the gap.
+      if (!inReach(cell)) break
       const k = key(cell.q, cell.r)
       if (!free.has(k)) continue // the ship's cell, or a duplicate in a hand-edited file
       free.delete(k)

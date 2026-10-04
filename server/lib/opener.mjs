@@ -60,7 +60,7 @@ const OPENERS = {
  * The `error` listener is not optional. An unhandled `error` event on a child process is an
  * unhandled exception, which would take the whole server down over a missing `xdg-open`.
  */
-function trySpawn(argv, target) {
+function trySpawn(argv, target, spawn) {
   return new Promise((resolve) => {
     const [cmd, ...args] = argv
     let child
@@ -91,9 +91,17 @@ function trySpawn(argv, target) {
  *
  * The scan path must never depend on whether presentation worked, so this never throws.
  */
-export async function openTarget(target) {
+export async function openTarget(target, { spawn: spawnFn = spawnImpl, platform = process.platform } = {}) {
   if (typeof target !== 'string' || !target) return
-  for (const argv of OPENERS[process.platform] || []) {
-    if (await trySpawn(argv, target)) return
+  for (const argv of OPENERS[platform] || []) {
+    if (await trySpawn(argv, target, spawnFn)) return
   }
+}
+
+/** Test seam: swap the process-spawner used when `openTarget` is not given one. Returns the old one. */
+let spawnImpl = spawn
+export function setSpawnForTests(fn) {
+  const old = spawnImpl
+  spawnImpl = fn || spawn
+  return old
 }

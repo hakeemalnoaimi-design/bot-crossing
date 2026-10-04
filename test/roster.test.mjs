@@ -8,8 +8,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { pickByPriority, fitToSlots, capRoster, priorityRank } from '../src/game/roster.js'
-import { allocateCells, ZONE_CAPACITY, PLOT_CELL } from '../src/world/plots.js'
-import { COLONY_RADIUS } from '../src/world/planet.js'
+import { allocateCells, layoutExtent, layoutReach, ZONE_CAPACITY, PLOT_CELL } from '../src/world/plots.js'
+import { COLONY_RADIUS, PLANETS, flatLimit, flatRadiusFor } from '../src/world/planet.js'
+import { Navigation } from '../src/agents/navigation.js'
 
 const row = (id, status, at, createdAt = at) => ({ thread: { id, lastActivityAt: at, createdAt }, status })
 
@@ -107,4 +108,93 @@ test('a mid-sized roster still lays out inside the flat colony radius', () => {
     }
   }
   assert.ok(far <= COLONY_RADIUS, `furthest cell centre at ${far.toFixed(1)}, flat ground ends at ${COLONY_RADIUS}`)
+})
+
+// ── the layout stays on flat, walkable ground ─────────────────────────────────────────
+
+/** A live roster: one big zone (216 threads, 63 drawn), a 43/7 one, and a scatter of small ones. */
+const LIVE_DRAWN = [63, 7, 6, 5, 4, 4, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1]
+const live = () => LIVE_DRAWN.map((size, i) => ({ id: `zone${i}`, size }))
+const centreOf = ({ q, r }) => Math.hypot(PLOT_CELL * 1.5 * q, PLOT_CELL * Math.sqrt(3) * (r + q / 2))
+
+test('seventeen zones stay on the flat ground and inside the walkable grid', () => {
+  const planet = PLANETS.bahrain
+  const reach = layoutReach(flatLimit(planet))
+  const layout = allocateCells(live(), new Map(), reach)
+  assert.equal(layout.size, 17)
+  assert.equal(layout.get('zone0').length, 9)
+
+  const extent = layoutExtent(layout)
+  const flat = flatRadiusFor(extent, planet)
+  const nav = new Navigation(flat + 10)
+  for (const cells of layout.values()) {
+    assert.ok(cells.length > 0, 'every zone is placed')
+    for (const cell of cells) {
+      const d = centreOf(cell)
+      assert.ok(d <= flat, `cell centre at ${d.toFixed(1)}, flat ground ends at ${flat}`)
+      assert.ok(d + PLOT_CELL <= flat, 'the whole tile is on flat ground, not only its middle')
+      assert.ok(d + PLOT_CELL < nav.half, `tile reaches ${(d + PLOT_CELL).toFixed(1)}, grid ends at ${nav.half}`)
+    }
+  }
+  // The colony never gets near the water: Bahrain's shore is at 74.
+  assert.ok(flat <= planet.sea.shore - 8)
+})
+
+test('a roster too big for the ground is packed tighter, not spread onto the dunes', () => {
+  const planet = PLANETS.bahrain
+  const reach = layoutReach(flatLimit(planet))
+  const big = Array.from({ length: 40 }, (_, i) => ({ id: `big${i}`, size: 63 }))
+  const layout = allocateCells(big, new Map(), reach)
+  for (const cells of layout.values()) for (const cell of cells) assert.ok(centreOf(cell) <= reach)
+  assert.ok(flatRadiusFor(layoutExtent(layout), planet) <= planet.sea.shore - 8)
+  // Nothing is placed twice.
+  const all = [...layout.values()].flat().map((c) => `${c.q},${c.r}`)
+  assert.equal(new Set(all).size, all.length)
+})
+
+test('saved zones inside the bounds keep their cells', () => {
+  const reach = layoutReach(flatLimit(PLANETS.bahrain))
+  const first = allocateCells(live(), new Map(), reach)
+  // Same roster with one more thread somewhere else: nobody who fits moves.
+  const grown = live()
+  grown[5].size += 3
+  const second = allocateCells(grown, first, reach)
+  for (const [id, cells] of first) {
+    if (id === 'zone5') {
+      assert.deepEqual(second.get(id).slice(0, cells.length), cells)
+      continue
+    }
+    assert.deepEqual(second.get(id), cells, `${id} moved`)
+  }
+})
+
+test('a saved zone that sits out past the flat ground is placed again, and the rest stay', () => {
+  const reach = layoutReach(flatLimit(PLANETS.bahrain))
+  const saved = new Map([
+    ['near', [{ q: 0, r: 0 }, { q: 1, r: 0 }]],
+    ['far', [{ q: 6, r: 0 }, { q: 6, r: 1 }]],
+  ])
+  assert.ok(centreOf({ q: 6, r: 0 }) > reach)
+  const layout = allocateCells(
+    [{ id: 'near', size: 14 }, { id: 'far', size: 14 }],
+    saved,
+    reach
+  )
+  assert.deepEqual(layout.get('near'), saved.get('near'))
+  assert.equal(layout.get('far').length, 2)
+  for (const cell of layout.get('far')) assert.ok(centreOf(cell) <= reach)
+})
+
+test('with no bound the layout is exactly what it always was', () => {
+  const sizes = [63, 40, 30, 20, 10]
+  const a = allocateCells(sizes.map((size, i) => ({ id: `z${i}`, size })))
+  const b = allocateCells(sizes.map((size, i) => ({ id: `z${i}`, size })), new Map(), Infinity)
+  assert.deepEqual([...a], [...b])
+})
+
+test('the flat radius never drops below the colony default and never reaches the shore', () => {
+  const planet = PLANETS.bahrain
+  assert.equal(flatRadiusFor(10, planet), COLONY_RADIUS)
+  assert.equal(flatRadiusFor(500, planet), flatLimit(planet))
+  assert.ok(planet.sea.shore - flatLimit(planet) >= 8)
 })

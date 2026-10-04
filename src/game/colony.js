@@ -1,11 +1,24 @@
 import * as THREE from 'three'
-import { PLANETS, createTerrain, createScatter, terrainHeight, waterUniforms, windUniforms } from '../world/planet.js'
+import {
+  PLANETS,
+  createTerrain,
+  createScatter,
+  terrainHeight,
+  waterUniforms,
+  windUniforms,
+  colonyRadius,
+  flatLimit,
+  flatRadiusFor,
+  setColonyRadius,
+} from '../world/planet.js'
 import { Sky } from '../world/sky.js'
 import { Gulls } from '../world/gulls.js'
 import { Boats } from '../world/boats.js'
 import {
   Plot,
   allocateCells,
+  layoutExtent,
+  layoutReach,
   shipPosition,
   createLabel,
   hashString,
@@ -421,9 +434,14 @@ export class Colony {
     // The previous layout is an input, so a zone only moves when its own footprint changes
     // — never because a different repo gained or lost a thread. `plotCells` carries it
     // between polls, and the colony file carries it between sessions.
+    //
+    // `list` is already only what will be drawn: dormant threads were folded away before the
+    // grouping, and a zone's footprint is capped at what its slots hold. The layout is held
+    // inside the flat ground the world allows, so a saved zone out past it is placed again.
     const layout = allocateCells(
       projects.map(([name, list]) => ({ id: name, size: list.length })),
-      this.plotCells
+      this.plotCells,
+      layoutReach(flatLimit(this.planet))
     )
     // Remembered, not replaced: a project that has just lost its last thread keeps its
     // ground on the books, and the oldest entries fall off the end.
@@ -467,8 +485,12 @@ export class Colony {
     })
 
     this.plotOrder = [...this.plots.values()]
+    // The flat ground and the walkable grid follow the layout, so a zone is never on a dune or
+    // off the edge of the map. A new radius is new terrain, and that rebuilds the scatter and
+    // the grid along with it.
+    if (setColonyRadius(flatRadiusFor(layoutExtent(layout), this.planet))) this._buildTerrain()
     // Zones that just moved, appeared or grew are zones the scatter does not know about.
-    if (this.scatterGroup && this._plotFootprint() !== this._scatterFootprint) this._buildScatter()
+    else if (this.scatterGroup && this._plotFootprint() !== this._scatterFootprint) this._buildScatter()
     // Which hex cells are decked. Ground height is asked for once per moving agent per
     // frame, so it wants to be a lookup rather than a scan over every plot's every tile.
     this.deckedCells = new Set()
@@ -584,6 +606,9 @@ export class Colony {
    * of buildings, which is exactly where the crew needs to walk.
    */
   _rebuildNavigation() {
+    // Walkable ground reaches a stride or two past the flat colony, so a builder can stand on
+    // the verge of the outermost zone and still walk home from it.
+    this.nav.resize(colonyRadius() + 10)
     const obstacles = []
     for (const entry of this.buildings.values()) {
       if (entry.retiring) continue
