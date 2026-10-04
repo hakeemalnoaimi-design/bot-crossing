@@ -295,7 +295,9 @@ test('the transcript meta cache is invalidated when the file changes', async () 
   await fsp.utimes(file, new Date(t0 + 10_000), new Date(t0 + 10_000))
   const [t] = await f.scan()
   assert.equal(t.title, 'changed prompt', 'a new mtime means a re-read')
-  assert.equal(t.lastActivityAt, t0 + 10_000)
+  // Within a millisecond: utimes rounds through the filesystem's own clock, and ext4 hands
+  // back 1791142595533.999 for a time set as ...534.
+  assert.ok(Math.abs(t.lastActivityAt - (t0 + 10_000)) < 1, `lastActivityAt ${t.lastActivityAt}`)
   await f.done()
 })
 
